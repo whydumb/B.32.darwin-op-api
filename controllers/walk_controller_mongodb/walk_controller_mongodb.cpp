@@ -17,6 +17,8 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <queue>
+#include <exception>
 
 using namespace webots;
 using namespace managers;
@@ -34,6 +36,17 @@ WalkMongoDB::WalkMongoDB() : Robot() {
     isWalking = false;
     hasActiveCommand = false;
     commandPollInterval = 500; // 0.5초마다 폴링
+    
+    // Initialize connection management variables
+    maxRetries = 3;
+    retryDelay = 1000;
+    isOnlineMode = true;
+    robotFallen = false;
+    commandsExecuted = 0;
+    commandsFailed = 0;
+    connectionFailures = 0;
+    averageExecutionTime = 0.0;
+    startTime = chrono::steady_clock::now();
     
     // cURL 초기화
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -75,6 +88,8 @@ WalkMongoDB::WalkMongoDB() : Robot() {
 }
 
 WalkMongoDB::~WalkMongoDB() {
+    shutdown();
+    
     if (curl) {
         curl_easy_cleanup(curl);
     }
@@ -115,11 +130,29 @@ void WalkMongoDB::loadConfig() {
                 commandPollInterval = stoi(intervalStr);
             }
         }
+        else if (line.find("max_retries") != string::npos) {
+            size_t pos = line.find("=");
+            if (pos != string::npos) {
+                string retriesStr = line.substr(pos + 1);
+                retriesStr.erase(0, retriesStr.find_first_not_of(" \t"));
+                maxRetries = stoi(retriesStr);
+            }
+        }
+        else if (line.find("retry_delay") != string::npos) {
+            size_t pos = line.find("=");
+            if (pos != string::npos) {
+                string delayStr = line.substr(pos + 1);
+                delayStr.erase(0, delayStr.find_first_not_of(" \t"));
+                retryDelay = stoi(delayStr);
+            }
+        }
     }
     
     cout << "MongoDB API URL: " << mongoApiUrl << endl;
     cout << "Robot ID: " << robotId << endl;
     cout << "Poll Interval: " << commandPollInterval << "ms" << endl;
+    cout << "Max Retries: " << maxRetries << endl;
+    cout << "Retry Delay: " << retryDelay << "ms" << endl;
 }
 
 void WalkMongoDB::initializeMongoDB() {
@@ -134,21 +167,34 @@ void WalkMongoDB::initializeMongoDB() {
     robotStatus["capabilities"].append("turn_right");
     robotStatus["capabilities"].append("stop");
     robotStatus["capabilities"].append("motion");
+    robotStatus["capabilities"].append("walk_direction");
+    robotStatus["capabilities"].append("set_speed");
+    robotStatus["capabilities"].append("emergency_stop");
     robotStatus["timestamp"] = chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count();
+    robotStatus["version"] = "2.0";
+    robotStatus["uptime"] = 0;
     
     Json::StreamWriterBuilder builder;
     string jsonString = Json::writeString(builder, robotStatus);
     
     string url = mongoApiUrl + "/robots/status";
-    HTTPResponse response = httpRequest(url, "POST", jsonString);
+    HTTPResponse response = httpRequestWithRetry(url, "POST", jsonString);
     
     if (response.responseCode == 200) {
         cout << "Successfully registered robot with MongoDB" << endl;
+        isOnlineMode = true;
     } else {
         cout << "Warning: Failed to register robot status: " << response.responseCode << endl;
         cout << "Robot will work in offline mode" << endl;
+        isOnlineMode = false;
     }
+}
+
+bool WalkMongoDB::checkConnectionHealth() {
+    string url = mongoApiUrl + "/health";
+    HTTPResponse response = httpRequest(url, "GET", "");
+    return response.responseCode == 200;
 }
 
 size_t WalkMongoDB::WriteCallback(void* contents, size_t size, size_t nmemb, HTTPResponse* response) {
@@ -169,10 +215,12 @@ HTTPResponse WalkMongoDB::httpRequest(const string& url, const string& method, c
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L); // 5초 타임아웃
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
     
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "User-Agent: RobotController/2.0");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     
     if (method == "POST") {
@@ -186,16 +234,118 @@ HTTPResponse WalkMongoDB::httpRequest(const string& url, const string& method, c
     
     if (res == CURLE_OK) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.responseCode);
+    } else {
+        cout << "cURL error: " << curl_easy_strerror(res) << endl;
     }
     
     curl_slist_free_all(headers);
     return response;
 }
 
+HTTPResponse WalkMongoDB::httpRequestWithRetry(const string& url, const string& method, const string& postData) {
+    HTTPResponse response;
+    
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        response = httpRequest(url, method, postData);
+        
+        if (response.responseCode == 200) {
+            if (!isOnlineMode) {
+                cout << "Connection restored - switching to online mode" << endl;
+                isOnlineMode = true;
+                processOfflineQueue();
+            }
+            return response;
+        }
+        
+        if (attempt < maxRetries - 1) {
+            cout << "HTTP request failed (attempt " << (attempt + 1) 
+                 << "/" << maxRetries << "), retrying in " << retryDelay << "ms..." << endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(retryDelay));
+        }
+    }
+    
+    if (isOnlineMode) {
+        cout << "Connection lost - switching to offline mode" << endl;
+        isOnlineMode = false;
+        connectionFailures++;
+    }
+    
+    return response;
+}
+
+void WalkMongoDB::processOfflineQueue() {
+    int processedCount = 0;
+    
+    while (!offlineCommandQueue.empty()) {
+        RobotCommand cmd = offlineCommandQueue.front();
+        offlineCommandQueue.pop();
+        
+        if (!isCommandExpired(cmd)) {
+            Json::Value cmdJson = commandToJson(cmd);
+            Json::StreamWriterBuilder builder;
+            string jsonString = Json::writeString(builder, cmdJson);
+            
+            string url = mongoApiUrl + "/commands";
+            HTTPResponse response = httpRequest(url, "POST", jsonString);
+            
+            if (response.responseCode == 200) {
+                processedCount++;
+            } else {
+                // Re-queue if failed
+                offlineCommandQueue.push(cmd);
+                break;
+            }
+        }
+    }
+    
+    if (processedCount > 0) {
+        cout << "Processed " << processedCount << " offline commands" << endl;
+    }
+}
+
+void WalkMongoDB::queueCommandOffline(const RobotCommand& command) {
+    if (offlineCommandQueue.size() >= 100) {
+        cout << "Offline command queue full, dropping oldest command" << endl;
+        offlineCommandQueue.pop();
+    }
+    offlineCommandQueue.push(command);
+    cout << "Command queued for offline processing: " << command.command << endl;
+}
+
+bool WalkMongoDB::validateMovementValue(double value, const string& commandType) {
+    if (commandType == "walk_forward" || commandType == "walk_backward" ||
+        commandType == "turn_left" || commandType == "turn_right" ||
+        commandType == "set_speed") {
+        if (value < 0.0 || value > 1.0) {
+            cout << "Warning: Invalid " << commandType << " value: " << value 
+                 << " (must be 0.0-1.0)" << endl;
+            return false;
+        }
+    }
+    
+    if (commandType == "walk_direction") {
+        if (value < -1.0 || value > 1.0) {
+            cout << "Warning: Invalid walk_direction value: " << value 
+                 << " (must be -1.0 to 1.0)" << endl;
+            return false;
+        }
+    }
+    
+    if (commandType == "motion") {
+        int motionPage = static_cast<int>(value);
+        if (motionPage < 1 || motionPage > 255) {
+            cout << "Warning: Invalid motion page: " << motionPage 
+                 << " (must be 1-255)" << endl;
+            return false;
+        }
+    }
+    
+    return true;
+}
+
 bool WalkMongoDB::pollForNewCommand() {
-    // MongoDB에서 새로운 명령 조회
     string url = mongoApiUrl + "/commands/pending?robotId=" + robotId + "&limit=1";
-    HTTPResponse response = httpRequest(url);
+    HTTPResponse response = httpRequestWithRetry(url);
     
     if (response.responseCode != 200) {
         return false;
@@ -210,12 +360,16 @@ bool WalkMongoDB::pollForNewCommand() {
     }
     
     if (root.isArray() && root.size() > 0) {
-        // 첫 번째 명령 선택 (가장 높은 우선순위)
         RobotCommand cmd = jsonToCommand(root[0]);
         
-        // 만료된 명령 스킵
         if (isCommandExpired(cmd)) {
             updateCommandStatus(cmd.id, "expired");
+            return false;
+        }
+        
+        if (!validateMovementValue(cmd.value, cmd.command)) {
+            updateCommandStatus(cmd.id, "failed");
+            commandsFailed++;
             return false;
         }
         
@@ -252,8 +406,24 @@ RobotCommand WalkMongoDB::jsonToCommand(const Json::Value& json) {
     return cmd;
 }
 
+Json::Value WalkMongoDB::commandToJson(const RobotCommand& cmd) {
+    Json::Value json;
+    json["_id"] = cmd.id;
+    json["robotId"] = cmd.robotId;
+    json["command"] = cmd.command;
+    json["value"] = cmd.value;
+    json["value2"] = cmd.value2;
+    json["duration"] = cmd.duration;
+    json["priority"] = cmd.priority;
+    json["status"] = cmd.status;
+    json["timestamp"] = cmd.timestamp;
+    json["expires_at"] = cmd.expires_at;
+    json["continuous"] = cmd.continuous;
+    return json;
+}
+
 bool WalkMongoDB::isCommandExpired(const RobotCommand& command) {
-    if (command.expires_at == 0) return false; // 만료 시간 없음
+    if (command.expires_at == 0) return false;
     
     auto now = chrono::duration_cast<chrono::milliseconds>(
         chrono::system_clock::now().time_since_epoch()).count();
@@ -264,10 +434,8 @@ bool WalkMongoDB::isCommandExpired(const RobotCommand& command) {
 bool WalkMongoDB::isCommandCompleted() {
     if (!hasActiveCommand) return true;
     
-    // 연속 실행 명령은 완료되지 않음
     if (currentCommand.continuous) return false;
     
-    // 지속시간 체크
     if (currentCommand.duration > 0) {
         auto elapsed = chrono::duration_cast<chrono::milliseconds>(
             chrono::steady_clock::now() - commandStartTime).count();
@@ -277,55 +445,92 @@ bool WalkMongoDB::isCommandCompleted() {
     return false;
 }
 
+double WalkMongoDB::calculateCommandProgress() {
+    if (!hasActiveCommand || currentCommand.duration <= 0) {
+        return 0.0;
+    }
+    
+    auto elapsed = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now() - commandStartTime).count();
+    
+    return min(1.0, static_cast<double>(elapsed) / currentCommand.duration);
+}
+
 void WalkMongoDB::executeCommand(const RobotCommand& command) {
-    if (command.command == "walk_forward") {
-        executeWalkForward(command.value);
-        
-    } else if (command.command == "walk_backward") {
-        executeWalkBackward(command.value);
-        
-    } else if (command.command == "turn_left") {
-        executeTurnLeft(command.value);
-        
-    } else if (command.command == "turn_right") {
-        executeTurnRight(command.value);
-        
-    } else if (command.command == "stop") {
-        executeStop();
-        
-    } else if (command.command == "motion") {
-        executeMotion(static_cast<int>(command.value));
-        
-    } else if (command.command == "walk_direction") {
-        // value: X 방향 속도, value2: 회전 속도
-        if (!isWalking) {
-            mGaitManager->start();
-            isWalking = true;
-            wait(200);
-        }
-        mGaitManager->setXAmplitude(max(-1.0, min(1.0, command.value)));
-        mGaitManager->setAAmplitude(max(-1.0, min(1.0, command.value2)));
-        
-    } else if (command.command == "set_speed") {
-        // 현재 방향 유지하면서 속도만 변경
-        if (isWalking) {
-            double currentX = mGaitManager->getXAmplitude();
-            double currentA = mGaitManager->getAAmplitude();
+    if (!validateMovementValue(command.value, command.command)) {
+        updateCommandStatus(command.id, "failed");
+        commandsFailed++;
+        return;
+    }
+    
+    auto executionStart = chrono::steady_clock::now();
+    
+    cout << "Executing: " << command.command 
+         << " (value: " << command.value << ")" << endl;
+    
+    try {
+        if (command.command == "walk_forward") {
+            executeWalkForward(command.value);
             
-            if (currentX != 0) {
-                mGaitManager->setXAmplitude(currentX > 0 ? command.value : -command.value);
+        } else if (command.command == "walk_backward") {
+            executeWalkBackward(command.value);
+            
+        } else if (command.command == "turn_left") {
+            executeTurnLeft(command.value);
+            
+        } else if (command.command == "turn_right") {
+            executeTurnRight(command.value);
+            
+        } else if (command.command == "stop") {
+            executeStop();
+            
+        } else if (command.command == "motion") {
+            executeMotion(static_cast<int>(command.value));
+            
+        } else if (command.command == "walk_direction") {
+            if (!isWalking) {
+                mGaitManager->start();
+                isWalking = true;
+                wait(200);
             }
-            if (currentA != 0) {
-                mGaitManager->setAAmplitude(currentA > 0 ? command.value : -command.value);
+            mGaitManager->setXAmplitude(max(-1.0, min(1.0, command.value)));
+            mGaitManager->setAAmplitude(max(-1.0, min(1.0, command.value2)));
+            
+        } else if (command.command == "set_speed") {
+            if (isWalking) {
+                double currentX = mGaitManager->getXAmplitude();
+                double currentA = mGaitManager->getAAmplitude();
+                
+                if (currentX != 0) {
+                    mGaitManager->setXAmplitude(currentX > 0 ? command.value : -command.value);
+                }
+                if (currentA != 0) {
+                    mGaitManager->setAAmplitude(currentA > 0 ? command.value : -command.value);
+                }
             }
+            
+        } else if (command.command == "emergency_stop") {
+            executeStop();
+            clearPendingCommands();
+            
+        } else {
+            cout << "Unknown command: " << command.command << endl;
+            updateCommandStatus(command.id, "failed");
+            commandsFailed++;
+            return;
         }
         
-    } else if (command.command == "emergency_stop") {
-        executeStop();
-        clearPendingCommands();
+        // Update execution metrics
+        commandsExecuted++;
+        auto executionTime = chrono::duration_cast<chrono::milliseconds>(
+            chrono::steady_clock::now() - executionStart).count();
         
-    } else {
-        cout << "Unknown command: " << command.command << endl;
+        averageExecutionTime = (averageExecutionTime * (commandsExecuted - 1) + executionTime) / commandsExecuted;
+        
+    } catch (const std::exception& e) {
+        cout << "Error executing command: " << e.what() << endl;
+        updateCommandStatus(command.id, "failed");
+        commandsFailed++;
     }
 }
 
@@ -382,7 +587,7 @@ void WalkMongoDB::executeMotion(int motionPage) {
         executeStop();
     }
     mMotionManager->playPage(motionPage);
-    wait(1000); // 모션 완료 대기
+    wait(1000);
 }
 
 void WalkMongoDB::updateCommandStatus(const string& commandId, const string& status) {
@@ -394,66 +599,113 @@ void WalkMongoDB::updateCommandStatus(const string& commandId, const string& sta
     
     if (status == "completed" || status == "executing") {
         statusUpdate["execution_time"] = getTime();
+        if (hasActiveCommand) {
+            statusUpdate["progress"] = calculateCommandProgress();
+        }
     }
     
     Json::StreamWriterBuilder builder;
     string jsonString = Json::writeString(builder, statusUpdate);
     
     string url = mongoApiUrl + "/commands/" + commandId + "/status";
-    HTTPResponse response = httpRequest(url, "PUT", jsonString);
     
-    // 오프라인 모드에서는 에러 메시지 표시하지 않음
-    if (response.responseCode != 200 && response.responseCode != 0) {
-        cout << "Failed to update command status (offline mode)" << endl;
+    if (isOnlineMode) {
+        HTTPResponse response = httpRequestWithRetry(url, "PUT", jsonString);
+        if (response.responseCode != 200) {
+            cout << "Failed to update command status: " << status << endl;
+        }
+    } else {
+        cout << "Offline mode - status update queued: " << status << endl;
     }
 }
 
 void WalkMongoDB::clearPendingCommands() {
     string url = mongoApiUrl + "/commands/clear?robotId=" + robotId;
-    HTTPResponse response = httpRequest(url, "POST", "{}");
+    HTTPResponse response = httpRequestWithRetry(url, "POST", "{}");
     
     if (response.responseCode == 200) {
         cout << "Cleared all pending commands" << endl;
+    } else {
+        cout << "Failed to clear pending commands" << endl;
     }
 }
 
 Json::Value WalkMongoDB::sensorDataToJson() {
     Json::Value data;
-    data["robotId"] = robotId;
-    data["timestamp"] = chrono::duration_cast<chrono::seconds>(
-        chrono::system_clock::now().time_since_epoch()).count();
-    data["robot_time"] = getTime();
-    data["isWalking"] = isWalking;
-    data["hasActiveCommand"] = hasActiveCommand;
-    data["robotState"] = isWalking ? "walking" : "standing";
     
-    if (hasActiveCommand) {
-        data["currentCommand"] = currentCommand.command;
-        data["commandValue"] = currentCommand.value;
-        data["commandDuration"] = currentCommand.duration;
-    }
-    
-    // 센서 데이터
-    const double *acc = mAccelerometer->getValues();
-    const double *gyro_vals = mGyro->getValues();
-    
-    Json::Value acc_array(Json::arrayValue);
-    acc_array.append(acc[0]);
-    acc_array.append(acc[1]);
-    acc_array.append(acc[2]);
-    data["accelerometer"] = acc_array;
-    
-    Json::Value gyro_array(Json::arrayValue);
-    gyro_array.append(gyro_vals[0]);
-    gyro_array.append(gyro_vals[1]);
-    gyro_array.append(gyro_vals[2]);
-    data["gyro"] = gyro_array;
-    
-    // 걸음 상태
-    if (isWalking) {
-        data["walkSpeed"] = Json::Value(Json::objectValue);
-        data["walkSpeed"]["x"] = mGaitManager->getXAmplitude();
-        data["walkSpeed"]["a"] = mGaitManager->getAAmplitude();
+    try {
+        data["robotId"] = robotId;
+        data["timestamp"] = chrono::duration_cast<chrono::seconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+        data["robot_time"] = getTime();
+        data["isWalking"] = isWalking;
+        data["hasActiveCommand"] = hasActiveCommand;
+        data["robotState"] = isWalking ? "walking" : "standing";
+        
+        // Connection and queue status
+        data["connectionStatus"] = isOnlineMode ? "online" : "offline";
+        data["queuedCommands"] = static_cast<int>(offlineCommandQueue.size());
+        data["robotFallen"] = robotFallen;
+        
+        // Performance metrics
+        data["metrics"] = Json::Value(Json::objectValue);
+        data["metrics"]["commandsExecuted"] = commandsExecuted;
+        data["metrics"]["commandsFailed"] = commandsFailed;
+        data["metrics"]["connectionFailures"] = connectionFailures;
+        data["metrics"]["averageExecutionTime"] = averageExecutionTime;
+        
+        auto uptime = chrono::duration_cast<chrono::seconds>(
+            chrono::steady_clock::now() - startTime).count();
+        data["metrics"]["uptime"] = uptime;
+        
+        if (hasActiveCommand) {
+            data["currentCommand"] = currentCommand.command;
+            data["commandValue"] = currentCommand.value;
+            data["commandDuration"] = currentCommand.duration;
+            data["commandProgress"] = calculateCommandProgress();
+            data["commandContinuous"] = currentCommand.continuous;
+        }
+        
+        // Sensor data with error handling
+        if (mAccelerometer) {
+            const double *acc = mAccelerometer->getValues();
+            if (acc) {
+                Json::Value acc_array(Json::arrayValue);
+                acc_array.append(acc[0]);
+                acc_array.append(acc[1]);
+                acc_array.append(acc[2]);
+                data["accelerometer"] = acc_array;
+            }
+        }
+        
+        if (mGyro) {
+            const double *gyro_vals = mGyro->getValues();
+            if (gyro_vals) {
+                Json::Value gyro_array(Json::arrayValue);
+                gyro_array.append(gyro_vals[0]);
+                gyro_array.append(gyro_vals[1]);
+                gyro_array.append(gyro_vals[2]);
+                data["gyro"] = gyro_array;
+            }
+        }
+        
+        // Walking parameters
+        if (isWalking && mGaitManager) {
+            data["walkSpeed"] = Json::Value(Json::objectValue);
+            data["walkSpeed"]["x"] = mGaitManager->getXAmplitude();
+            data["walkSpeed"]["a"] = mGaitManager->getAAmplitude();
+        }
+        
+        // System health
+        data["health"] = Json::Value(Json::objectValue);
+        data["health"]["temperature"] = "normal";
+        data["health"]["battery"] = "good";
+        data["health"]["motors"] = "operational";
+        
+    } catch (const std::exception& e) {
+        cout << "Error creating sensor data JSON: " << e.what() << endl;
+        data["error"] = "Failed to collect sensor data";
+        data["error_details"] = e.what();
     }
     
     return data;
@@ -465,242 +717,93 @@ void WalkMongoDB::saveSensorData() {
     string jsonString = Json::writeString(builder, jsonData);
     
     string url = mongoApiUrl + "/sensor-data";
-    httpRequest(url, "POST", jsonString);
+    
+    if (isOnlineMode) {
+        HTTPResponse response = httpRequest(url, "POST", jsonString);
+        if (response.responseCode != 200) {
+            cout << "Failed to save sensor data (code: " << response.responseCode << ")" << endl;
+        }
+    }
 }
 
 void WalkMongoDB::updateRobotStatus() {
     Json::Value status;
     status["robotId"] = robotId;
-    status["status"] = "online";
+    status["status"] = isOnlineMode ? "online" : "offline";
     status["isWalking"] = isWalking;
     status["hasActiveCommand"] = hasActiveCommand;
     status["timestamp"] = chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count();
     
+    // Performance metrics
+    auto uptime = chrono::duration_cast<chrono::seconds>(
+        chrono::steady_clock::now() - startTime).count();
+    status["uptime"] = uptime;
+    status["queuedCommands"] = static_cast<int>(offlineCommandQueue.size());
+    status["commandsExecuted"] = commandsExecuted;
+    status["commandsFailed"] = commandsFailed;
+    status["connectionFailures"] = connectionFailures;
+    
+    // Health status
+    status["health"] = Json::Value(Json::objectValue);
+    status["health"]["fallen"] = robotFallen;
+    status["health"]["temperature"] = "normal";
+    status["health"]["operational"] = true;
+    
     Json::StreamWriterBuilder builder;
     string jsonString = Json::writeString(builder, status);
     
     string url = mongoApiUrl + "/robots/status";
-    httpRequest(url, "PUT", jsonString);
-}
-
-void WalkMongoDB::myStep() {
-    int ret = step(mTimeStep);
-    if (ret == -1)
-        exit(EXIT_SUCCESS);
-}
-
-void WalkMongoDB::wait(int ms) {
-    double startTime = getTime();
-    double s = (double)ms / 1000.0;
-    while (s + startTime >= getTime())
-        myStep();
-}
-
-void WalkMongoDB::run() {
-    cout << "=================================================" << endl;
-    cout << "    Walk MongoDB Real-Time Controller v1.0" << endl;
-    cout << "=================================================" << endl;
-    cout << "Real-time command processing from MongoDB" << endl;
-    cout << "API URL: " << mongoApiUrl << endl;
-    cout << "Robot ID: " << robotId << endl;
-    cout << "Poll Interval: " << commandPollInterval << "ms" << endl;
-    cout << endl;
-    cout << "Available Commands:" << endl;
-    cout << "  walk_forward, walk_backward" << endl;
-    cout << "  turn_left, turn_right" << endl;
-    cout << "  stop, motion, walk_direction" << endl;
-    cout << "  emergency_stop" << endl;
-    cout << endl;
-    cout << "Local Controls:" << endl;
-    cout << "  SPACE - Emergency stop" << endl;
-    cout << "  s     - Stop current action" << endl;
-    cout << "  d     - Debug info" << endl;
-    cout << "  q     - Quit" << endl;
-    cout << "=================================================" << endl;
     
-    // 초기화
-    myStep();
-    mMotionManager->playPage(9); // 초기 자세
-    wait(2000);
-    
-    auto lastSensorSave = chrono::steady_clock::now();
-    auto lastStatusUpdate = chrono::steady_clock::now();
-    auto lastDebugOutput = chrono::steady_clock::now();
-    
-    cout << "\nStarting real-time command processing..." << endl;
-    cout << "Waiting for commands from MongoDB..." << endl;
-    
-    while (true) {
-        checkIfFallen();
-        auto currentTime = chrono::steady_clock::now();
-        
-        // 새로운 명령 폴링
-        auto timeSinceLastPoll = chrono::duration_cast<chrono::milliseconds>(
-            currentTime - lastCommandPoll).count();
-        
-        if (timeSinceLastPoll >= commandPollInterval) {
-            if (!hasActiveCommand) {
-                pollForNewCommand();
-            }
-            lastCommandPoll = currentTime;
+    if (isOnlineMode) {
+        HTTPResponse response = httpRequestWithRetry(url, "PUT", jsonString);
+        if (response.responseCode != 200) {
+            cout << "Failed to update robot status" << endl;
         }
-        
-        // 활성 명령 실행 및 완료 체크
-        if (hasActiveCommand) {
-            executeCommand(currentCommand);
-            
-            if (isCommandCompleted()) {
-                updateCommandStatus(currentCommand.id, "completed");
-                cout << "Command completed: " << currentCommand.command << endl;
-                hasActiveCommand = false;
-            }
-        }
-        
-        // 주기적 센서 데이터 저장 (5초마다)
-        if (chrono::duration_cast<chrono::milliseconds>(currentTime - lastSensorSave).count() >= 5000) {
-            saveSensorData();
-            lastSensorSave = currentTime;
-        }
-        
-        // 로봇 상태 업데이트 (10초마다)
-        if (chrono::duration_cast<chrono::milliseconds>(currentTime - lastStatusUpdate).count() >= 10000) {
-            updateRobotStatus();
-            lastStatusUpdate = currentTime;
-        }
-        
-        // 상태 출력 (30초마다)
-        if (chrono::duration_cast<chrono::milliseconds>(currentTime - lastDebugOutput).count() >= 30000) {
-            cout << "Status: " << (isWalking ? "Walking" : "Standing")
-                 << " | Active Command: " << (hasActiveCommand ? currentCommand.command : "None") << endl;
-            lastDebugOutput = currentTime;
-        }
-        
-        // 키보드 제어 (로컬 디버깅용)
-        int key = 0;
-        while ((key = mKeyboard->getKey()) >= 0) {
-            switch (key) {
-                case ' ':  // 긴급 정지
-                    cout << "\n!!! EMERGENCY STOP !!!" << endl;
-                    hasActiveCommand = false;
-                    executeStop();
-                    clearPendingCommands();
-                    break;
-                    
-                case 's':  // 정지
-                    cout << "\nManual stop" << endl;
-                    hasActiveCommand = false;
-                    executeStop();
-                    break;
-                    
-                case 'd':  // 디버그 정보
-                    cout << "\n=== DEBUG INFO ===" << endl;
-                    cout << "Robot ID: " << robotId << endl;
-                    cout << "Is Walking: " << (isWalking ? "Yes" : "No") << endl;
-                    cout << "Has Active Command: " << (hasActiveCommand ? "Yes" : "No") << endl;
-                    if (hasActiveCommand) {
-                        cout << "Current Command: " << currentCommand.command << endl;
-                        cout << "Command Value: " << currentCommand.value << endl;
-                        cout << "Command Duration: " << currentCommand.duration << "ms" << endl;
-                        cout << "Continuous: " << (currentCommand.continuous ? "Yes" : "No") << endl;
-                        
-                        auto elapsed = chrono::duration_cast<chrono::milliseconds>(
-                            chrono::steady_clock::now() - commandStartTime).count();
-                        cout << "Elapsed Time: " << elapsed << "ms" << endl;
-                    }
-                    if (isWalking) {
-                        cout << "Walk X Amplitude: " << mGaitManager->getXAmplitude() << endl;
-                        cout << "Walk A Amplitude: " << mGaitManager->getAAmplitude() << endl;
-                    }
-                    cout << "Poll Interval: " << commandPollInterval << "ms" << endl;
-                    cout << "MongoDB URL: " << mongoApiUrl << endl;
-                    cout << "=================" << endl;
-                    break;
-                    
-                case 'q':  // 종료
-                    cout << "\nShutting down robot..." << endl;
-                    executeStop();
-                    updateRobotStatus();
-                    exit(EXIT_SUCCESS);
-                    break;
-            }
-        }
-        
-        // Gait Manager 스텝 (걷고 있을 때만)
-        if (isWalking) {
-            mGaitManager->step(mTimeStep);
-        }
-        
-        myStep();
+    } else {
+        cout << "Offline mode - status update skipped" << endl;
     }
 }
 
-void WalkMongoDB::checkIfFallen() {
-    static int fup = 0;
-    static int fdown = 0;
-    static const double acc_tolerance = 80.0;
-    static const double acc_step = 100;
-
-    const double *acc = mAccelerometer->getValues();
-    if (acc[1] < 512.0 - acc_tolerance)
-        fup++;
-    else
-        fup = 0;
-
-    if (acc[1] > 512.0 + acc_tolerance)
-        fdown++;
-    else
-        fdown = 0;
-
-    // 로봇이 넘어진 경우
-    if (fup > acc_step) {
-        cout << "Robot fell forward - recovering..." << endl;
-        hasActiveCommand = false;  // 현재 명령 중단
-        executeStop();
-        mMotionManager->playPage(10);  // f_up
-        mMotionManager->playPage(9);   // init position
-        fup = 0;
-        
-        // 넘어짐 이벤트 로그
-        Json::Value fallEvent;
-        fallEvent["robotId"] = robotId;
-        fallEvent["event"] = "fall_forward";
-        fallEvent["timestamp"] = chrono::duration_cast<chrono::seconds>(
-            chrono::system_clock::now().time_since_epoch()).count();
-        fallEvent["robot_time"] = getTime();
-        if (hasActiveCommand) {
-            fallEvent["interrupted_command"] = currentCommand.command;
-        }
-        
-        Json::StreamWriterBuilder builder;
-        string jsonString = Json::writeString(builder, fallEvent);
-        
-        string url = mongoApiUrl + "/events";
-        httpRequest(url, "POST", jsonString);
+void WalkMongoDB::shutdown() {
+    cout << "Initiating graceful shutdown..." << endl;
+    
+    // Stop all movement
+    executeStop();
+    
+    // Update final command status
+    if (hasActiveCommand) {
+        updateCommandStatus(currentCommand.id, "interrupted");
     }
-    else if (fdown > acc_step) {
-        cout << "Robot fell backward - recovering..." << endl;
-        hasActiveCommand = false;  // 현재 명령 중단
-        executeStop();
-        mMotionManager->playPage(11);  // b_up
-        mMotionManager->playPage(9);   // init position
-        fdown = 0;
-        
-        // 넘어짐 이벤트 로그
-        Json::Value fallEvent;
-        fallEvent["robotId"] = robotId;
-        fallEvent["event"] = "fall_backward";
-        fallEvent["timestamp"] = chrono::duration_cast<chrono::seconds>(
-            chrono::system_clock::now().time_since_epoch()).count();
-        fallEvent["robot_time"] = getTime();
-        if (hasActiveCommand) {
-            fallEvent["interrupted_command"] = currentCommand.command;
+    
+    // Update robot status to offline
+    Json::Value status;
+    status["robotId"] = robotId;
+    status["status"] = "offline";
+    
+    Json::StreamWriterBuilder builder;
+    string jsonString = Json::writeString(builder, status);
+    
+    string url = mongoApiUrl + "/robots/status";
+    
+    if (isOnlineMode) {
+        HTTPResponse response = httpRequestWithRetry(url, "PUT", jsonString);
+        if (response.responseCode != 200) {
+            cout << "Failed to update robot status to offline" << endl;
         }
-        
-        Json::StreamWriterBuilder builder;
-        string jsonString = Json::writeString(builder, fallEvent);
-        
-        string url = mongoApiUrl + "/events";
-        httpRequest(url, "POST", jsonString);
+    } else {
+        cout << "Offline mode - status update skipped" << endl;
     }
-}
+    
+    // Clean up resources
+    if (curl) {
+        curl_easy_cleanup(curl);
+    }
+    curl_global_cleanup();
+    
+    // Delete all commands
+    clearPendingCommands();
+    
+    // Delete all sensor data
+    deleteSensorData();
+}    
