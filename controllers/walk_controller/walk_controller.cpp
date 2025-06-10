@@ -13,13 +13,12 @@
 // limitations under the License.
 
 /*
-When running this controller in the real robot
-do not interface via SSh client (i,e, PuTTY)
-The result will be on a segmentation fault error.
+실제 로봇에서 이 컨트롤러를 실행할 때는
+SSH 클라이언트(예: PuTTY)를 통해 인터페이스하지 마세요
+세그멘테이션 오류가 발생합니다.
 
-Instead interface with the robot via remote desktop
-(i.e. VNC). Open a terminal window, compile controller
-and run.
+대신 원격 데스크톱(예: VNC)을 통해 로봇과 인터페이스하세요.
+터미널 창을 열고, 컨트롤러를 컴파일하고 실행하세요.
 */
 #include "walk_controller.hpp"
 
@@ -89,21 +88,21 @@ void Walk::wait(int ms) {
     myStep();
 }
 
-// function containing the main feedback loop
+// 메인 피드백 루프를 포함하는 함수
 void Walk::run() {
-  cout << "-------Walk example of ROBOTIS OP2-------" << endl;
-  cout << "This example illustrates Gait Manager" << endl;
-  cout << "Press the space bar to start/stop walking" << endl;
-  cout << "Use the arrow keys to move the robot while walking" << endl;
+  cout << "-------ROBOTIS OP2 보행 예제-------" << endl;
+  cout << "이 예제는 보행 관리자를 보여줍니다" << endl;
+  cout << "스페이스바를 눌러 보행을 시작/정지하세요" << endl;
+  cout << "보행 중에 화살표 키를 사용하여 로봇을 움직이세요" << endl;
 
-  // First step to update sensors values
+  // 센서 값을 업데이트하기 위한 첫 번째 단계
   myStep();
 
-  // play the hello motion
-  mMotionManager->playPage(9);  // init position
+  // hello 모션 재생
+  mMotionManager->playPage(9);  // 초기 위치
   wait(200);
 
-  // main loop
+  // 메인 루프
   bool isWalking = false;
 
   while (true) {
@@ -112,11 +111,11 @@ void Walk::run() {
     mGaitManager->setXAmplitude(0.0);
     mGaitManager->setAAmplitude(0.0);
 
-    // get keyboard key
+    // 키보드 키 입력 받기
     int key = 0;
     while ((key = mKeyboard->getKey()) >= 0) {
       switch (key) {
-        case ' ':  // Space bar
+        case ' ':  // 스페이스바
           if (isWalking) {
             mGaitManager->stop();
             isWalking = false;
@@ -144,7 +143,7 @@ void Walk::run() {
 
     mGaitManager->step(mTimeStep);
 
-    // step
+    // 단계 실행
     myStep();
   }
 }
@@ -155,8 +154,8 @@ void Walk::checkIfFallen() {
   static const double acc_tolerance = 80.0;
   static const double acc_step = 100;
 
-  // count how many steps the accelerometer
-  // says that the robot is down
+  // 가속도계가 로봇이 넘어졌다고 
+  // 판단하는 단계의 수를 세기
   const double *acc = mAccelerometer->getValues();
   if (acc[1] < 512.0 - acc_tolerance)
     fup++;
@@ -168,16 +167,16 @@ void Walk::checkIfFallen() {
   else
     fdown = 0;
 
-  // the robot face is down
+  // 로봇이 앞으로 넘어진 경우
   if (fup > acc_step) {
     mMotionManager->playPage(10);  // f_up
-    mMotionManager->playPage(9);   // init position
+    mMotionManager->playPage(9);   // 초기 위치
     fup = 0;
   }
-  // the back face is down
+  // 로봇이 뒤로 넘어진 경우
   else if (fdown > acc_step) {
     mMotionManager->playPage(11);  // b_up
-    mMotionManager->playPage(9);   // init position
+    mMotionManager->playPage(9);   // 초기 위치
     fdown = 0;
   }
 }
