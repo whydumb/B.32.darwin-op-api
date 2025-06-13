@@ -1,5 +1,5 @@
 // walk_controller_mongodb.hpp
-// MongoDB 연동이 추가된 Walk Controller 헤더
+// 기존 Webots 구조에 맞춘 MongoDB 연동 헤더
 
 #ifndef WALK_MONGODB_HPP
 #define WALK_MONGODB_HPP
@@ -7,11 +7,18 @@
 #define NMOTORS 20
 
 #include <webots/Robot.hpp>
+
+// 절대 경로로 MongoDB 헤더 포함
 #include <mongocxx/client.hpp>
 #include <mongocxx/database.hpp>
 #include <mongocxx/collection.hpp>
+#include <mongocxx/instance.hpp>
+#include <bsoncxx/json.hpp>
+#include <bsoncxx/builder/stream/document.hpp>
+
 #include <string>
 #include <map>
+#include <memory>
 
 namespace managers {
   class RobotisOp2MotionManager;
@@ -68,10 +75,10 @@ private:
   managers::RobotisOp2MotionManager *mMotionManager;
   managers::RobotisOp2GaitManager *mGaitManager;
 
-  // MongoDB 관련
-  mongocxx::client mMongoClient;
-  mongocxx::database mDatabase;
-  mongocxx::collection mCollection;
+  // MongoDB 관련 (원시 포인터 사용)
+  mongocxx::client *mMongoClient;
+  mongocxx::database *mDatabase;
+  mongocxx::collection *mCollection;
 
   // ActionType 매핑
   std::map<std::string, GaitParams> mActionMap;
