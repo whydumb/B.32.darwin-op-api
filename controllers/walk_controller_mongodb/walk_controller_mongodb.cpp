@@ -1,4 +1,4 @@
-// walk_controller_mongodb.cpp - MongoDB 기능 추가 버전
+// walk_controller_mongodb.cpp - MongoDB 기능 추가 버전 (수정됨)
 #include "walk_controller_mongodb.hpp"
 #include <RobotisOp2GaitManager.hpp>
 #include <RobotisOp2MotionManager.hpp>
@@ -11,6 +11,7 @@
 #include <mongocxx/client.hpp>
 #include <mongocxx/instance.hpp>
 #include <bsoncxx/json.hpp>
+#include <bsoncxx/builder/stream/document.hpp>
 #endif
 
 #include <cmath>
@@ -20,6 +21,11 @@
 using namespace webots;
 using namespace managers;
 using namespace std;
+
+#ifdef USE_MONGODB
+using bsoncxx::builder::stream::document;
+using bsoncxx::builder::stream::finalize;
+#endif
 
 static const char *motorNames[NMOTORS] = {
   "ShoulderR", "ShoulderL", "ArmUpperR", "ArmUpperL", "ArmLowerR",
@@ -45,19 +51,22 @@ Walk::Walk() : Robot() {
     mPositionSensors[i]->enable(mTimeStep);
   }
 
-
-
   mMotionManager = new RobotisOp2MotionManager(this);
   mGaitManager = new RobotisOp2GaitManager(this, "config.ini");
 
 #ifdef USE_MONGODB
-  // MongoDB 초기화 (매우 간단)
-  mMongoInstance = make_unique<mongocxx::instance>();
-  mMongoClient = make_unique<mongocxx::client>(mongocxx::uri{});
-  mCollection = (*mMongoClient)["movement_tracker"]["movementtracker"];
-  mMongoConnected = true;
-  cout << "[MongoDB] 연결됨" << endl;
-  mMongoCheckCounter = 0;
+  try {
+    // MongoDB 초기화
+    mMongoInstance = make_unique<mongocxx::instance>();
+    mMongoClient = make_unique<mongocxx::client>(mongocxx::uri{});
+    mCollection = (*mMongoClient)["movement_tracker"]["movementtracker"];
+    mMongoConnected = true;
+    mMongoCheckCounter = 0;
+    cout << "[MongoDB] 연결 성공 - movement_tracker.movementtracker 컬렉션" << endl;
+  } catch (const exception& e) {
+    mMongoConnected = false;
+    cout << "[MongoDB] 연결 실패: " << e.what() << endl;
+  }
 #endif
 }
 
@@ -81,72 +90,117 @@ void Walk::wait(int ms) {
 
 #ifdef USE_MONGODB
 string Walk::getMongoAction() {
-  auto cursor = mCollection.find({});
-  for (auto&& doc : cursor) {
-    auto action_element = doc["action"];
-    if (action_element && action_element.type() == bsoncxx::type::k_utf8) {
-      return action_element.get_utf8().value.to_string();
-    }
+  if (!mMongoConnected) {
+    return "idle";
   }
-  return "idle";
+
+  try {
+    // replay_name이 "your_database_name"인 문서만 필터링
+    auto filter = document{} << "replay_name" << "your_database_name" << finalize;
+    
+    // 첫 번째 매칭 문서 찾기
+    auto maybe_result = mCollection.find_one(filter.view());
+    
+    if (maybe_result) {
+      auto doc = maybe_result.value();
+      
+      // current_action 필드 추출
+      auto action_element = doc["current_action"];
+      
+      if (action_element && action_element.type() == bsoncxx::type::k_utf8) {
+        string action = action_element.get_utf8().value.to_string();
+        cout << "[MongoDB] replay_name='your_database_name'에서 current_action: " << action << endl;
+        return action;
+      } else {
+        cout << "[MongoDB] current_action 필드가 없거나 문자열이 아닙니다." << endl;
+        return "idle";
+      }
+    } else {
+      cout << "[MongoDB] replay_name 'your_database_name'인 문서를 찾을 수 없습니다." << endl;
+      return "idle";
+    }
+    
+  } catch (const exception& e) {
+    cout << "[MongoDB] 쿼리 오류: " << e.what() << endl;
+    return "idle";
+  }
 }
 
 void Walk::executeMongoAction(const string& action) {
+  cout << "[실행] 액션: " << action << endl;
+  
   if (action == "forward") {
     mGaitManager->setXAmplitude(1.0);
     mGaitManager->setAAmplitude(0.0);
+    cout << "→ 앞으로 걷기" << endl;
   }
   else if (action == "backward") {
     mGaitManager->setXAmplitude(-1.0);
     mGaitManager->setAAmplitude(0.0);
+    cout << "→ 뒤로 걷기" << endl;
   }
   else if (action == "left") {
     mGaitManager->setXAmplitude(0.0);
     mGaitManager->setAAmplitude(0.5);
+    cout << "→ 왼쪽으로 회전" << endl;
   }
   else if (action == "right") {
     mGaitManager->setXAmplitude(0.0);
     mGaitManager->setAAmplitude(-0.5);
+    cout << "→ 오른쪽으로 회전" << endl;
   }
   else { // "idle" 또는 기타
     mGaitManager->setXAmplitude(0.0);
     mGaitManager->setAAmplitude(0.0);
+    cout << "→ 제자리 서기" << endl;
   }
 }
 #endif
 
 void Walk::run() {
-  cout << "-------MongoDB 전용 Walk Controller-------" << endl;
+  cout << "=======================================" << endl;
+  cout << "MongoDB 통합 ROBOTIS OP2 Walk Controller" << endl;
+  cout << "=======================================" << endl;
+  
 #ifdef USE_MONGODB
-  cout << "MongoDB에서 action 읽어서 자동 제어" << endl;
+  cout << "MongoDB에서 replay_name='your_database_name'의" << endl;
+  cout << "current_action 값을 읽어서 자동 제어합니다." << endl;
 #else
   cout << "MongoDB 비활성화 - 정지 상태" << endl;
 #endif
+  cout << "=======================================" << endl;
 
   myStep();
   
-  // 초기 위치
+  // 초기 위치로 이동
+  cout << "[초기화] 기본 자세로 이동중..." << endl;
   mMotionManager->playPage(9);
   wait(200);
 
 #ifdef USE_MONGODB
-  // 자동으로 걷기 시작
-  mGaitManager->start();
-  bool isWalking = true;
-  cout << "걷기 시작..." << endl;
+  if (mMongoConnected) {
+    // 자동으로 걷기 시작
+    mGaitManager->start();
+    cout << "[시작] 걷기 모드 활성화" << endl;
+    cout << "[대기] MongoDB에서 명령 대기중..." << endl;
+  } else {
+    cout << "[오류] MongoDB 연결 실패 - 정지 상태" << endl;
+  }
 #endif
 
-  // 메인 루프 - MongoDB 데이터만으로 제어
+  // 메인 루프 - MongoDB 데이터로 제어
   while (true) {
     checkIfFallen();
 
 #ifdef USE_MONGODB
-    // MongoDB에서 액션 읽고 바로 적용
-    mMongoCheckCounter++;
-    if (mMongoCheckCounter >= 10) {
-      string mongoAction = getMongoAction();
-      executeMongoAction(mongoAction);
-      mMongoCheckCounter = 0;
+    if (mMongoConnected) {
+      // 10번의 스텝마다 MongoDB 체크 (약 160ms마다)
+      mMongoCheckCounter++;
+      if (mMongoCheckCounter >= 10) {
+        string mongoAction = getMongoAction();
+        executeMongoAction(mongoAction);
+        mMongoCheckCounter = 0;
+      }
     }
 #endif
 
@@ -173,11 +227,13 @@ void Walk::checkIfFallen() {
     fdown = 0;
 
   if (fup > acc_step) {
+    cout << "[낙상감지] 앞으로 넘어짐 - 복구중..." << endl;
     mMotionManager->playPage(10); // f_up
     mMotionManager->playPage(9);  // init position
     fup = 0;
   }
   else if (fdown > acc_step) {
+    cout << "[낙상감지] 뒤로 넘어짐 - 복구중..." << endl;
     mMotionManager->playPage(11); // b_up
     mMotionManager->playPage(9);  // init position
     fdown = 0;
