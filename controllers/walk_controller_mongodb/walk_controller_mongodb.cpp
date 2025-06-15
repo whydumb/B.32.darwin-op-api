@@ -54,7 +54,7 @@ Walk::Walk() : Robot() {
   // MongoDB 초기화 (매우 간단)
   mMongoInstance = make_unique<mongocxx::instance>();
   mMongoClient = make_unique<mongocxx::client>(mongocxx::uri{});
-  mCollection = (*mMongoClient)["robot_control"]["current_action"];
+  mCollection = (*mMongoClient)["movement_tracker"]["movementtracker"];
   mMongoConnected = true;
   cout << "[MongoDB] 연결됨" << endl;
   mMongoCheckCounter = 0;
