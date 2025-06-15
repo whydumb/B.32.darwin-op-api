@@ -1,5 +1,5 @@
 // walk_controller_mongodb.hpp
-// MongoDB integrated Walk Controller Header for Webots
+// MongoDB integrated Walk Controller Header for Webots (C API Version)
 #ifndef WALK_MONGODB_HPP
 #define WALK_MONGODB_HPP
 
@@ -12,19 +12,17 @@
 #include <webots/Accelerometer.hpp>
 #include <webots/Keyboard.hpp>
 
-// MongoDB headers
-#include <mongocxx/client.hpp>
-#include <mongocxx/database.hpp>
-#include <mongocxx/collection.hpp>
-#include <mongocxx/instance.hpp>
-#include <bsoncxx/json.hpp>
-#include <bsoncxx/builder/stream/document.hpp>
+// MongoDB C API headers (더 안정적!)
+#include <mongoc/mongoc.h>
+#include <bson/bson.h>
 
 // Standard C++ headers
 #include <string>
 #include <map>
 #include <memory>
 #include <iostream>
+#include <cstring>
+#include <ctime>
 
 // Forward declarations for ROBOTIS managers
 namespace managers {
@@ -32,7 +30,7 @@ namespace managers {
     class RobotisOp2GaitManager;
 }
 
-// Forward declarations for Webots classes (optional, already included above)
+// Forward declarations for Webots classes
 namespace webots {
     class Motor;
     class PositionSensor;
@@ -44,6 +42,19 @@ namespace webots {
     class Speaker;
 }
 
+// ActionType enum (Java 호환)
+enum ActionType {
+    FORWARD,
+    BACKWARD,
+    LEFT,
+    RIGHT,
+    FORWARD_LEFT,
+    FORWARD_RIGHT,
+    BACKWARD_LEFT,
+    BACKWARD_RIGHT,
+    IDLE
+};
+
 // Gait parameters structure
 struct GaitParams {
     double xAmplitude;  // Forward/backward movement (-1.0 ~ 1.0)
@@ -53,6 +64,27 @@ struct GaitParams {
     // Constructor for easy initialization
     GaitParams(double x = 0.0, double a = 0.0, bool start = false) 
         : xAmplitude(x), aAmplitude(a), startGait(start) {}
+};
+
+// C API MongoDB wrapper class
+class CMongoController {
+private:
+    mongoc_client_t *client;
+    mongoc_database_t *database;
+    mongoc_collection_t *collection;
+    bool connected;
+    
+public:
+    CMongoController();
+    ~CMongoController();
+    
+    bool isConnected() const { return connected; }
+    ActionType getCurrentAction();
+    bool saveAction(ActionType action);
+    
+private:
+    ActionType stringToActionType(const char* actionStr);
+    const char* actionTypeToString(ActionType action);
 };
 
 class Walk : public webots::Robot {
@@ -71,17 +103,19 @@ private:
     // Basic properties
     int mTimeStep;
     bool mIsWalking;
+    ActionType mLastAction;
+    int mActionCheckCounter;
     
     // Basic methods
     void myStep();
     void wait(int ms);
     
-    // MongoDB related methods
-    void initializeMongoDB();
+    // Action execution
+    void executeAction(ActionType action);
     void initializeActionMapper();
-    void applyActionFromMongoDB(const std::string& actionStr);
+    
+    // MongoDB related methods
     void readAndExecuteFromMongoDB();
-    void playbackFromMongoDB();
     
     // Webots hardware interface
     webots::Motor *mMotors[NMOTORS];
@@ -93,13 +127,15 @@ private:
     managers::RobotisOp2MotionManager *mMotionManager;
     managers::RobotisOp2GaitManager *mGaitManager;
     
-    // MongoDB related (using raw pointers for compatibility)
-    mongocxx::client *mMongoClient;
-    mongocxx::database *mDatabase;
-    mongocxx::collection *mCollection;
+    // MongoDB C API controller
+    CMongoController *mMongoController;
     
     // Action mapping
-    std::map<std::string, GaitParams> mActionMap;
+    std::map<ActionType, GaitParams> mActionMap;
 };
+
+// Utility functions
+const char* actionTypeToString(ActionType action);
+ActionType stringToActionType(const char* actionStr);
 
 #endif // WALK_MONGODB_HPP
