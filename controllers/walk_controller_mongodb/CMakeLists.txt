@@ -73,10 +73,10 @@ else()
     message(STATUS "MongoDB support disabled (use -DENABLE_MONGODB=ON to enable)")
 endif()
 
-# 소스 파일들
+# 소스 파일들 (수정됨!)
 set(SOURCES
     main.cpp
-    walk_controller.cpp
+    walk_controller_mongodb.cpp  # ← 올바른 파일명으로 수정!
 )
 
 # 실행 파일 생성
