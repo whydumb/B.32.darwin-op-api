@@ -1,28 +1,39 @@
-// walk_controller_mongodb.hpp
-// MongoDB integrated Walk Controller Header for Webots (C API Version)
-#ifndef WALK_MONGODB_HPP
-#define WALK_MONGODB_HPP
+// walk_controller.hpp - MongoDB 기능 추가 버전
+#ifndef WALK_CONTROLLER_HPP
+#define WALK_CONTROLLER_HPP
 
 #define NMOTORS 20
 
-// Webots headers
+// 기존 Webots headers
 #include <webots/Robot.hpp>
 #include <webots/Motor.hpp>
 #include <webots/PositionSensor.hpp>
 #include <webots/Accelerometer.hpp>
 #include <webots/Keyboard.hpp>
+#include <webots/LED.hpp>
+#include <webots/Gyro.hpp>
 
-// MongoDB C API headers (더 안정적!)
-#include <mongoc/mongoc.h>
-#include <bson/bson.h>
-
-// Standard C++ headers
+// 기존 표준 라이브러리
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
 #include <string>
 #include <map>
-#include <memory>
-#include <iostream>
-#include <cstring>
-#include <ctime>
+
+// MongoDB C++ API headers (새로 추가)
+#ifdef USE_MONGODB
+#include <mongocxx/client.hpp>
+#include <mongocxx/instance.hpp>
+#include <mongocxx/uri.hpp>
+#include <mongocxx/database.hpp>
+#include <mongocxx/collection.hpp>
+#include <bsoncxx/json.hpp>
+#include <bsoncxx/builder/stream/document.hpp>
+#include <bsoncxx/builder/stream/array.hpp>
+#include <chrono>
+#include <optional>
+#endif
 
 // Forward declarations for ROBOTIS managers
 namespace managers {
@@ -35,14 +46,12 @@ namespace webots {
     class Motor;
     class PositionSensor;
     class LED;
-    class Camera;
     class Accelerometer;
     class Gyro;
     class Keyboard;
-    class Speaker;
 }
 
-// ActionType enum (Java 호환)
+// ActionType enum (MongoDB용)
 enum ActionType {
     FORWARD,
     BACKWARD,
@@ -55,87 +64,75 @@ enum ActionType {
     IDLE
 };
 
-// Gait parameters structure
-struct GaitParams {
-    double xAmplitude;  // Forward/backward movement (-1.0 ~ 1.0)
-    double aAmplitude;  // Left/right rotation (-0.5 ~ 0.5)
-    bool startGait;     // Whether to start walking
-    
-    // Constructor for easy initialization
-    GaitParams(double x = 0.0, double a = 0.0, bool start = false) 
-        : xAmplitude(x), aAmplitude(a), startGait(start) {}
-};
-
-// C API MongoDB wrapper class
-class CMongoController {
+#ifdef USE_MONGODB
+// MongoDB Controller 클래스 (조건부 컴파일)
+class MongoDBController {
 private:
-    mongoc_client_t *client;
-    mongoc_database_t *database;
-    mongoc_collection_t *collection;
+    std::unique_ptr<mongocxx::instance> instance;
+    std::unique_ptr<mongocxx::client> client;
+    mongocxx::database database;
+    mongocxx::collection collection;
     bool connected;
     
 public:
-    CMongoController();
-    ~CMongoController();
+    MongoDBController();
+    ~MongoDBController() = default;
     
     bool isConnected() const { return connected; }
-    ActionType getCurrentAction();
-    bool saveAction(ActionType action);
+    std::optional<ActionType> getCurrentAction();
+    bool saveAction(ActionType action, const std::string& source = "manual");
     
 private:
-    ActionType stringToActionType(const char* actionStr);
-    const char* actionTypeToString(ActionType action);
+    ActionType stringToActionType(const std::string& actionStr);
+    std::string actionTypeToString(ActionType action);
+    std::int64_t getCurrentTimestamp();
 };
+#endif
 
 class Walk : public webots::Robot {
 public:
-    // Constructor and destructor
     Walk();
     virtual ~Walk();
     
-    // Main execution method
     void run();
-    
-    // Utility methods
     void checkIfFallen();
 
 private:
-    // Basic properties
     int mTimeStep;
-    bool mIsWalking;
-    ActionType mLastAction;
-    int mActionCheckCounter;
     
-    // Basic methods
-    void myStep();
-    void wait(int ms);
-    
-    // Action execution
-    void executeAction(ActionType action);
-    void initializeActionMapper();
-    
-    // MongoDB related methods
-    void readAndExecuteFromMongoDB();
-    
-    // Webots hardware interface
+    // 기존 멤버 변수들
     webots::Motor *mMotors[NMOTORS];
     webots::PositionSensor *mPositionSensors[NMOTORS];
     webots::Accelerometer *mAccelerometer;
+    webots::Gyro *mGyro;
     webots::Keyboard *mKeyboard;
     
-    // ROBOTIS managers
+    // ROBOTIS managers (기존)
     managers::RobotisOp2MotionManager *mMotionManager;
     managers::RobotisOp2GaitManager *mGaitManager;
     
-    // MongoDB C API controller
-    CMongoController *mMongoController;
+    // MongoDB 관련 (새로 추가, 조건부)
+#ifdef USE_MONGODB
+    std::unique_ptr<MongoDBController> mMongoController;
+    bool mIsWalking;
+    ActionType mLastAction;
+    int mActionCheckCounter;
+    std::map<ActionType, std::pair<double, double>> mActionMap; // x, a amplitudes
     
-    // Action mapping
-    std::map<ActionType, GaitParams> mActionMap;
+    void executeAction(ActionType action);
+    void readAndExecuteFromMongoDB();
+    void initializeActionMapper();
+#endif
+    
+    // 기존 메서드들
+    void myStep();
+    void wait(int ms);
 };
 
-// Utility functions
-const char* actionTypeToString(ActionType action);
-ActionType stringToActionType(const char* actionStr);
+// Utility functions (조건부)
+#ifdef USE_MONGODB
+std::string actionTypeToString(ActionType action);
+ActionType stringToActionType(const std::string& actionStr);
+#endif
 
-#endif // WALK_MONGODB_HPP
+#endif // WALK_CONTROLLER_HPP
