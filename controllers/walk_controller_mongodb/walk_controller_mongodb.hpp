@@ -1,6 +1,6 @@
 // walk_controller.hpp - MongoDB 기능 추가 버전
-#ifndef WALK_CONTROLLER_HPP
-#define WALK_CONTROLLER_HPP
+#ifndef walk_controller_mongodb_HPP
+#define walk_controller_mongodb_HPP
 
 #define NMOTORS 20
 
