@@ -1,8 +1,5 @@
-// walk_controller_mongodb.cpp
-// MongoDB integrated Walk Controller for Webots (C API Version)
-
-#include "walk_controller_mongodb.hpp"  // 헤더명 통일!
-
+// walk_controller_mongodb.cpp - MongoDB 기능 추가 버전
+#include "walk_controller_mongodb.hpp"
 #include <RobotisOp2GaitManager.hpp>
 #include <RobotisOp2MotionManager.hpp>
 #include <webots/Accelerometer.hpp>
@@ -14,9 +11,8 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
-#include <string>
-#include <cstring>
 
 using namespace webots;
 using namespace managers;
@@ -29,8 +25,9 @@ static const char *motorNames[NMOTORS] = {
   "AnkleL", "FootR", "FootL", "Neck", "Head"
 };
 
-// ActionType 변환 함수들
-const char* actionTypeToString(ActionType action) {
+#ifdef USE_MONGODB
+// MongoDB 유틸리티 함수들
+string actionTypeToString(ActionType action) {
     switch(action) {
         case FORWARD: return "FORWARD";
         case BACKWARD: return "BACKWARD";
@@ -45,145 +42,123 @@ const char* actionTypeToString(ActionType action) {
     }
 }
 
-ActionType stringToActionType(const char* actionStr) {
-    if (strcmp(actionStr, "FORWARD") == 0) return FORWARD;
-    if (strcmp(actionStr, "BACKWARD") == 0) return BACKWARD;
-    if (strcmp(actionStr, "LEFT") == 0) return LEFT;
-    if (strcmp(actionStr, "RIGHT") == 0) return RIGHT;
-    if (strcmp(actionStr, "FORWARD_LEFT") == 0) return FORWARD_LEFT;
-    if (strcmp(actionStr, "FORWARD_RIGHT") == 0) return FORWARD_RIGHT;
-    if (strcmp(actionStr, "BACKWARD_LEFT") == 0) return BACKWARD_LEFT;
-    if (strcmp(actionStr, "BACKWARD_RIGHT") == 0) return BACKWARD_RIGHT;
+ActionType stringToActionType(const string& actionStr) {
+    if (actionStr == "FORWARD") return FORWARD;
+    if (actionStr == "BACKWARD") return BACKWARD;
+    if (actionStr == "LEFT") return LEFT;
+    if (actionStr == "RIGHT") return RIGHT;
+    if (actionStr == "FORWARD_LEFT") return FORWARD_LEFT;
+    if (actionStr == "FORWARD_RIGHT") return FORWARD_RIGHT;
+    if (actionStr == "BACKWARD_LEFT") return BACKWARD_LEFT;
+    if (actionStr == "BACKWARD_RIGHT") return BACKWARD_RIGHT;
     return IDLE;
 }
 
-// CMongoController 구현
-CMongoController::CMongoController() {
-    // MongoDB C 드라이버 초기화
-    mongoc_init();
-    
-    // 클라이언트 생성
-    client = mongoc_client_new("mongodb://localhost:27017");
-    if (!client) {
-        cout << "MongoDB 클라이언트 생성 실패!" << endl;
-        connected = false;
-        return;
-    }
-    
-    // 데이터베이스 및 컬렉션 설정
-    database = mongoc_client_get_database(client, "robot_control");
-    collection = mongoc_client_get_collection(client, "robot_control", "current_action");
-    
-    connected = true;
-    cout << "MongoDB C API 연결 성공!" << endl;
-}
-
-CMongoController::~CMongoController() {
-    if (connected) {
-        mongoc_collection_destroy(collection);
-        mongoc_database_destroy(database);
-        mongoc_client_destroy(client);
-        mongoc_cleanup();
-    }
-}
-
-ActionType CMongoController::getCurrentAction() {
-    if (!connected) return IDLE;
-    
-    bson_t *query = bson_new();
-    bson_t *opts = bson_new();
-    
-    // 최신 문서 찾기 위한 정렬 옵션
-    bson_t sort;
-    bson_init(&sort);
-    BSON_APPEND_INT32(&sort, "timestamp", -1);
-    
-    bson_t limit;
-    bson_init(&limit);
-    BSON_APPEND_INT32(&limit, "limit", 1);
-    
-    // 옵션 설정
-    BSON_APPEND_DOCUMENT(opts, "sort", &sort);
-    BSON_APPEND_DOCUMENT(opts, "limit", &limit);
-    
-    // 쿼리 실행
-    mongoc_cursor_t *cursor = mongoc_collection_find_with_opts(collection, query, opts, NULL);
-    
-    ActionType result = IDLE;
-    const bson_t *doc;
-    
-    if (mongoc_cursor_next(cursor, &doc)) {
-        bson_iter_t iter;
+// MongoDBController 구현
+MongoDBController::MongoDBController() : connected(false) {
+    try {
+        instance = make_unique<mongocxx::instance>();
+        mongocxx::uri uri{"mongodb://localhost:27017"};
+        client = make_unique<mongocxx::client>(uri);
         
-        if (bson_iter_init_find(&iter, doc, "action")) {
-            const char *action_str = bson_iter_utf8(&iter, NULL);
-            result = stringToActionType(action_str);
-        }
-    } else {
-        // 에러 체크
-        bson_error_t error;
-        if (mongoc_cursor_error(cursor, &error)) {
-            cout << "MongoDB 쿼리 에러: " << error.message << endl;
-        }
+        database = (*client)["robot_control"];
+        collection = database["current_action"];
+        
+        // 연결 테스트
+        auto ping_cmd = bsoncxx::builder::stream::document{} << "ping" << 1 << bsoncxx::builder::stream::finalize;
+        database.run_command(ping_cmd.view());
+        
+        connected = true;
+        cout << "[MongoDB] 연결 성공!" << endl;
+        
+    } catch (const exception& e) {
+        cout << "[MongoDB] 연결 실패: " << e.what() << endl;
+        connected = false;
     }
-    
-    // 메모리 정리
-    mongoc_cursor_destroy(cursor);
-    bson_destroy(query);
-    bson_destroy(opts);
-    bson_destroy(&sort);
-    bson_destroy(&limit);
-    
-    return result;
 }
 
-bool CMongoController::saveAction(ActionType action) {
+optional<ActionType> MongoDBController::getCurrentAction() {
+    if (!connected) return nullopt;
+    
+    try {
+        auto opts = mongocxx::options::find{};
+        opts.sort(bsoncxx::builder::stream::document{} << "timestamp" << -1 << bsoncxx::builder::stream::finalize);
+        opts.limit(1);
+        
+        auto cursor = collection.find({}, opts);
+        
+        for (auto&& doc : cursor) {
+            auto action_element = doc["action"];
+            if (action_element && action_element.type() == bsoncxx::type::k_utf8) {
+                string action_str = action_element.get_utf8().value.to_string();
+                return stringToActionType(action_str);
+            }
+        }
+        
+        return nullopt;
+        
+    } catch (const exception& e) {
+        cout << "[MongoDB] 읽기 에러: " << e.what() << endl;
+        return nullopt;
+    }
+}
+
+bool MongoDBController::saveAction(ActionType action, const string& source) {
     if (!connected) return false;
     
-    bson_t *doc = bson_new();
-    bson_error_t error;
-    
-    // 현재 시간을 타임스탬프로 사용
-    int64_t timestamp = time(NULL) * 1000; // milliseconds
-    
-    // 문서 생성
-    BSON_APPEND_UTF8(doc, "action", actionTypeToString(action));
-    BSON_APPEND_DATE_TIME(doc, "timestamp", timestamp);
-    
-    // 삽입 실행
-    bool success = mongoc_collection_insert_one(collection, doc, NULL, NULL, &error);
-    
-    if (success) {
-        cout << "액션 저장 성공: " << actionTypeToString(action) << endl;
-    } else {
-        cout << "액션 저장 실패: " << error.message << endl;
+    try {
+        auto timestamp = getCurrentTimestamp();
+        
+        auto doc = bsoncxx::builder::stream::document{}
+            << "action" << actionTypeToString(action)
+            << "timestamp" << bsoncxx::types::b_date{chrono::milliseconds{timestamp}}
+            << "source" << source
+            << "robot_id" << "webots_op2"
+            << bsoncxx::builder::stream::finalize;
+        
+        auto result = collection.insert_one(doc.view());
+        
+        if (result) {
+            cout << "[MongoDB] 액션 저장: " << actionTypeToString(action) << endl;
+            return true;
+        }
+        
+        return false;
+        
+    } catch (const exception& e) {
+        cout << "[MongoDB] 저장 실패: " << e.what() << endl;
+        return false;
     }
-    
-    bson_destroy(doc);
-    return success;
 }
 
-ActionType CMongoController::stringToActionType(const char* actionStr) {
-    return ::stringToActionType(actionStr); // 전역 함수 호출
+ActionType MongoDBController::stringToActionType(const string& actionStr) {
+    return ::stringToActionType(actionStr);
 }
 
-const char* CMongoController::actionTypeToString(ActionType action) {
-    return ::actionTypeToString(action); // 전역 함수 호출
+string MongoDBController::actionTypeToString(ActionType action) {
+    return ::actionTypeToString(action);
 }
+
+int64_t MongoDBController::getCurrentTimestamp() {
+    auto now = chrono::system_clock::now();
+    auto timestamp = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch());
+    return timestamp.count();
+}
+#endif // USE_MONGODB
 
 // Walk 클래스 구현
 Walk::Walk() : Robot() {
     mTimeStep = getBasicTimeStep();
-    mIsWalking = false;
-    mLastAction = IDLE;
-    mActionCheckCounter = 0;
     
+    // 기존 초기화
     getLED("HeadLed")->set(0xFF0000);
     getLED("EyeLed")->set(0x00FF00);
+    
     mAccelerometer = getAccelerometer("Accelerometer");
     mAccelerometer->enable(mTimeStep);
     
-    getGyro("Gyro")->enable(mTimeStep);
+    mGyro = getGyro("Gyro");
+    mGyro->enable(mTimeStep);
     
     for (int i = 0; i < NMOTORS; i++) {
         mMotors[i] = getMotor(motorNames[i]);
@@ -199,50 +174,61 @@ Walk::Walk() : Robot() {
     mMotionManager = new RobotisOp2MotionManager(this);
     mGaitManager = new RobotisOp2GaitManager(this, "config.ini");
     
-    // MongoDB 컨트롤러 초기화
-    mMongoController = new CMongoController();
-    
-    // 액션 매핑 초기화
+#ifdef USE_MONGODB
+    // MongoDB 관련 초기화 (조건부)
+    mMongoController = make_unique<MongoDBController>();
+    mIsWalking = false;
+    mLastAction = IDLE;
+    mActionCheckCounter = 0;
     initializeActionMapper();
+#endif
 }
 
 Walk::~Walk() {
-    delete mMongoController;
     delete mMotionManager;
     delete mGaitManager;
+#ifdef USE_MONGODB
+    // mMongoController는 unique_ptr이므로 자동 해제
+#endif
 }
 
+#ifdef USE_MONGODB
 void Walk::initializeActionMapper() {
-    mActionMap[FORWARD] = GaitParams(1.0, 0.0, true);
-    mActionMap[BACKWARD] = GaitParams(-1.0, 0.0, true);
-    mActionMap[LEFT] = GaitParams(0.0, 0.5, true);
-    mActionMap[RIGHT] = GaitParams(0.0, -0.5, true);
-    mActionMap[FORWARD_LEFT] = GaitParams(0.7, 0.3, true);
-    mActionMap[FORWARD_RIGHT] = GaitParams(0.7, -0.3, true);
-    mActionMap[BACKWARD_LEFT] = GaitParams(-0.7, 0.3, true);
-    mActionMap[BACKWARD_RIGHT] = GaitParams(-0.7, -0.3, true);
-    mActionMap[IDLE] = GaitParams(0.0, 0.0, false);
+    // x_amplitude, a_amplitude
+    mActionMap[FORWARD] = make_pair(1.0, 0.0);
+    mActionMap[BACKWARD] = make_pair(-1.0, 0.0);
+    mActionMap[LEFT] = make_pair(0.0, 0.5);
+    mActionMap[RIGHT] = make_pair(0.0, -0.5);
+    mActionMap[FORWARD_LEFT] = make_pair(0.7, 0.3);
+    mActionMap[FORWARD_RIGHT] = make_pair(0.7, -0.3);
+    mActionMap[BACKWARD_LEFT] = make_pair(-0.7, 0.3);
+    mActionMap[BACKWARD_RIGHT] = make_pair(-0.7, -0.3);
+    mActionMap[IDLE] = make_pair(0.0, 0.0);
 }
 
 void Walk::executeAction(ActionType action) {
-    if (mLastAction == action) return; // 같은 액션이면 무시
+    if (mLastAction == action) return;
     
-    cout << "액션 실행: " << actionTypeToString(action) << endl;
+    cout << "[Action] 실행: " << actionTypeToString(action) << endl;
     
     auto it = mActionMap.find(action);
     if (it != mActionMap.end()) {
-        const GaitParams& params = it->second;
+        double xAmplitude = it->second.first;
+        double aAmplitude = it->second.second;
         
-        if (params.startGait && !mIsWalking) {
-            mGaitManager->start();
-            mIsWalking = true;
-        } else if (!params.startGait && mIsWalking) {
-            mGaitManager->stop();
-            mIsWalking = false;
+        if (action == IDLE) {
+            if (mIsWalking) {
+                mGaitManager->stop();
+                mIsWalking = false;
+            }
+        } else {
+            if (!mIsWalking) {
+                mGaitManager->start();
+                mIsWalking = true;
+            }
+            mGaitManager->setXAmplitude(xAmplitude);
+            mGaitManager->setAAmplitude(aAmplitude);
         }
-        
-        mGaitManager->setXAmplitude(params.xAmplitude);
-        mGaitManager->setAAmplitude(params.aAmplitude);
     }
     
     mLastAction = action;
@@ -250,10 +236,13 @@ void Walk::executeAction(ActionType action) {
 
 void Walk::readAndExecuteFromMongoDB() {
     if (mMongoController && mMongoController->isConnected()) {
-        ActionType currentAction = mMongoController->getCurrentAction();
-        executeAction(currentAction);
+        auto actionOpt = mMongoController->getCurrentAction();
+        if (actionOpt.has_value()) {
+            executeAction(actionOpt.value());
+        }
     }
 }
+#endif // USE_MONGODB
 
 void Walk::myStep() {
     int ret = step(mTimeStep);
@@ -269,10 +258,14 @@ void Walk::wait(int ms) {
 }
 
 void Walk::run() {
-    cout << "-------ROBOTIS OP2 MongoDB C API 제어-------" << endl;
-    cout << "MongoDB에서 ActionType을 읽어 자동 제어" << endl;
-    cout << "키보드 제어:" << endl;
-    cout << "스페이스바: 정지, 화살표키: 방향, 숫자키: 테스트" << endl;
+    cout << "=== ROBOTIS OP2 Walk Controller ===" << endl;
+#ifdef USE_MONGODB
+    cout << "MongoDB 지원: 활성화" << endl;
+    cout << "키보드 제어: W/A/S/D (방향), Space (정지), 1-8 (테스트)" << endl;
+#else
+    cout << "MongoDB 지원: 비활성화" << endl;
+    cout << "기본 키보드 제어만 사용" << endl;
+#endif
     
     myStep();
     
@@ -283,16 +276,19 @@ void Walk::run() {
     while (true) {
         checkIfFallen();
         
-        // 10번에 한 번씩만 MongoDB 체크 (성능 최적화)
+#ifdef USE_MONGODB
+        // MongoDB 액션 체크 (10번에 한 번)
         mActionCheckCounter++;
         if (mActionCheckCounter >= 10) {
             readAndExecuteFromMongoDB();
             mActionCheckCounter = 0;
         }
+#endif
         
-        // 키보드 수동 제어
+        // 키보드 입력 처리
         int key = 0;
         while ((key = mKeyboard->getKey()) >= 0) {
+#ifdef USE_MONGODB
             ActionType keyAction = IDLE;
             bool saveToMongo = false;
             
@@ -301,23 +297,30 @@ void Walk::run() {
                     keyAction = IDLE;
                     saveToMongo = true;
                     break;
+                case 'W':
+                case 'w':
                 case Keyboard::UP:
                     keyAction = FORWARD;
                     saveToMongo = true;
                     break;
+                case 'S':
+                case 's':
                 case Keyboard::DOWN:
                     keyAction = BACKWARD;
                     saveToMongo = true;
                     break;
+                case 'A':
+                case 'a':
                 case Keyboard::LEFT:
                     keyAction = LEFT;
                     saveToMongo = true;
                     break;
+                case 'D':
+                case 'd':
                 case Keyboard::RIGHT:
                     keyAction = RIGHT;
                     saveToMongo = true;
                     break;
-                // 테스트용 숫자 키
                 case '1': keyAction = FORWARD; saveToMongo = true; break;
                 case '2': keyAction = BACKWARD; saveToMongo = true; break;
                 case '3': keyAction = LEFT; saveToMongo = true; break;
@@ -332,14 +335,35 @@ void Walk::run() {
             if (saveToMongo) {
                 executeAction(keyAction);
                 if (mMongoController && mMongoController->isConnected()) {
-                    mMongoController->saveAction(keyAction);
+                    mMongoController->saveAction(keyAction, "keyboard");
                 }
             }
+#else
+            // MongoDB 없는 기본 키보드 처리
+            switch (key) {
+                case ' ':
+                    cout << "[기본] 정지" << endl;
+                    mGaitManager->stop();
+                    break;
+                case 'W':
+                case 'w':
+                case Keyboard::UP:
+                    cout << "[기본] 전진" << endl;
+                    mGaitManager->start();
+                    mGaitManager->setXAmplitude(1.0);
+                    mGaitManager->setAAmplitude(0.0);
+                    break;
+                // 기타 기본 동작들...
+            }
+#endif
         }
         
+#ifdef USE_MONGODB
+        // 걷기 동작 업데이트
         if (mIsWalking) {
             mGaitManager->step(mTimeStep);
         }
+#endif
         
         myStep();
     }
@@ -363,13 +387,15 @@ void Walk::checkIfFallen() {
         fdown = 0;
     
     if (fup > acc_step) {
-        mMotionManager->playPage(10);
-        mMotionManager->playPage(9);
+        cout << "[낙상감지] 앞으로 넘어짐!" << endl;
+        mMotionManager->playPage(10); // get up front
+        mMotionManager->playPage(9);  // go to walking position
         fup = 0;
     }
     else if (fdown > acc_step) {
-        mMotionManager->playPage(11);
-        mMotionManager->playPage(9);
+        cout << "[낙상감지] 뒤로 넘어짐!" << endl;
+        mMotionManager->playPage(11); // get up back
+        mMotionManager->playPage(9);  // go to walking position
         fdown = 0;
     }
 }
