@@ -1,4 +1,4 @@
-// walk_controller_mongodb.cpp - MongoDB 기능 추가 버전 (수정됨)
+// walk_controller_mongodb.cpp - 개선된 MongoDB 버전
 #include "walk_controller_mongodb.hpp"
 #include <RobotisOp2GaitManager.hpp>
 #include <RobotisOp2MotionManager.hpp>
@@ -10,13 +10,19 @@
 #ifdef USE_MONGODB
 #include <mongocxx/client.hpp>
 #include <mongocxx/instance.hpp>
+#include <mongocxx/database.hpp>
+#include <mongocxx/uri.hpp>
 #include <bsoncxx/json.hpp>
 #include <bsoncxx/builder/stream/document.hpp>
+#include <bsoncxx/types.hpp>
+#include <bsoncxx/view_or_value.hpp>
 #endif
 
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 
 using namespace webots;
 using namespace managers;
@@ -55,18 +61,9 @@ Walk::Walk() : Robot() {
   mGaitManager = new RobotisOp2GaitManager(this, "config.ini");
 
 #ifdef USE_MONGODB
-  try {
-    // MongoDB 초기화
-    mMongoInstance = make_unique<mongocxx::instance>();
-    mMongoClient = make_unique<mongocxx::client>(mongocxx::uri{});
-    mCollection = (*mMongoClient)["movement_tracker"]["movementtracker"];
-    mMongoConnected = true;
-    mMongoCheckCounter = 0;
-    cout << "[MongoDB] 연결 성공 - movement_tracker.movementtracker 컬렉션" << endl;
-  } catch (const exception& e) {
-    mMongoConnected = false;
-    cout << "[MongoDB] 연결 실패: " << e.what() << endl;
-  }
+  // config.ini에서 MongoDB 설정 읽기
+  loadMongoConfig();
+  initializeMongoDB();
 #endif
 }
 
@@ -74,6 +71,168 @@ Walk::~Walk() {
   delete mMotionManager;
   delete mGaitManager;
 }
+
+#ifdef USE_MONGODB
+void Walk::loadMongoConfig() {
+  // 기본값 설정
+  mDbName = "movement_tracker";
+  mCollectionName = "movementtracker";
+  mReplayName = "your_database_name";
+  mPollInterval = 500;
+  mMongoUri = "mongodb://localhost:27017";
+  
+  ifstream configFile("config.ini");
+  if (!configFile.is_open()) {
+    cout << "[Config] config.ini 파일을 찾을 수 없습니다. 기본값 사용" << endl;
+    return;
+  }
+  
+  string line;
+  while (getline(configFile, line)) {
+    if (line.find("replay_name") != string::npos) {
+      size_t pos = line.find("=");
+      if (pos != string::npos) {
+        mReplayName = line.substr(pos + 1);
+        // 공백 제거
+        mReplayName.erase(0, mReplayName.find_first_not_of(" \t"));
+        mReplayName.erase(mReplayName.find_last_not_of(" \t") + 1);
+      }
+    }
+    else if (line.find("poll_interval") != string::npos) {
+      size_t pos = line.find("=");
+      if (pos != string::npos) {
+        string value = line.substr(pos + 1);
+        mPollInterval = stoi(value);
+      }
+    }
+  }
+  
+  cout << "[Config] Replay Name: " << mReplayName << ", Poll Interval: " << mPollInterval << "ms" << endl;
+}
+
+void Walk::initializeMongoDB() {
+  try {
+    mMongoInstance = make_unique<mongocxx::instance>();
+    mMongoClient = make_unique<mongocxx::client>(mongocxx::uri{mMongoUri});
+    mCollection = (*mMongoClient)[mDbName][mCollectionName];
+    mMongoConnected = true;
+    mMongoCheckCounter = 0;
+    mLastAction = "idle";
+    mReconnectAttempts = 0;
+    
+    // 연결 테스트
+    testMongoConnection();
+    
+    cout << "[MongoDB] 연결 성공 - " << mDbName << "." << mCollectionName << endl;
+  } catch (const exception& e) {
+    mMongoConnected = false;
+    cout << "[MongoDB] 연결 실패: " << e.what() << endl;
+  }
+}
+
+void Walk::testMongoConnection() {
+  try {
+    // 간단한 ping 테스트
+    auto admin = (*mMongoClient)["admin"];
+    auto result = admin.run_command(document{} << "ping" << 1 << finalize);
+    cout << "[MongoDB] 연결 테스트 성공" << endl;
+  } catch (const exception& e) {
+    cout << "[MongoDB] 연결 테스트 실패: " << e.what() << endl;
+    throw;
+  }
+}
+
+bool Walk::reconnectMongoDB() {
+  if (mReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    cout << "[MongoDB] 최대 재연결 시도 횟수 초과" << endl;
+    return false;
+  }
+  
+  cout << "[MongoDB] 재연결 시도 " << (mReconnectAttempts + 1) << "/" << MAX_RECONNECT_ATTEMPTS << endl;
+  mReconnectAttempts++;
+  
+  try {
+    mMongoClient = make_unique<mongocxx::client>(mongocxx::uri{mMongoUri});
+    mCollection = (*mMongoClient)[mDbName][mCollectionName];
+    testMongoConnection();
+    
+    mMongoConnected = true;
+    mReconnectAttempts = 0;
+    cout << "[MongoDB] 재연결 성공" << endl;
+    return true;
+  } catch (const exception& e) {
+    cout << "[MongoDB] 재연결 실패: " << e.what() << endl;
+    return false;
+  }
+}
+
+string Walk::getMongoAction() {
+  if (!mMongoConnected) {
+    if (!reconnectMongoDB()) {
+      return mLastAction; // 마지막 성공한 액션 유지
+    }
+  }
+
+  try {
+    // replay_name으로 필터링
+    auto filter = document{} << "replay_name" << mReplayName << finalize;
+    
+    auto maybe_result = mCollection.find_one(filter.view());
+    
+    if (maybe_result) {
+      auto doc = maybe_result.value();
+      auto action_element = doc["current_action"];
+      
+      if (action_element && action_element.type() == bsoncxx::type::k_utf8) {
+        string action = action_element.get_utf8().value.to_string();
+        
+        // 액션이 변경되었을 때만 로그 출력
+        if (action != mLastAction) {
+          cout << "[MongoDB] Replay '" << mReplayName << "' 새 액션: " << action << endl;
+          mLastAction = action;
+        }
+        
+        mReconnectAttempts = 0; // 성공시 재연결 카운터 리셋
+        return action;
+      } else {
+        cout << "[MongoDB] current_action 필드가 없거나 잘못된 타입입니다." << endl;
+        return mLastAction;
+      }
+    } else {
+      cout << "[MongoDB] replay_name '" << mReplayName << "'인 문서를 찾을 수 없습니다." << endl;
+      return mLastAction;
+    }
+    
+  } catch (const exception& e) {
+    cout << "[MongoDB] 쿼리 오류: " << e.what() << endl;
+    mMongoConnected = false;
+    return mLastAction;
+  }
+}
+
+void Walk::executeMongoAction(const string& action) {
+  if (action == "forward") {
+    mGaitManager->setXAmplitude(1.0);
+    mGaitManager->setAAmplitude(0.0);
+  }
+  else if (action == "backward") {
+    mGaitManager->setXAmplitude(-1.0);
+    mGaitManager->setAAmplitude(0.0);
+  }
+  else if (action == "left") {
+    mGaitManager->setXAmplitude(0.0);
+    mGaitManager->setAAmplitude(0.5);
+  }
+  else if (action == "right") {
+    mGaitManager->setXAmplitude(0.0);
+    mGaitManager->setAAmplitude(-0.5);
+  }
+  else { // "idle" 또는 기타
+    mGaitManager->setXAmplitude(0.0);
+    mGaitManager->setAAmplitude(0.0);
+  }
+}
+#endif
 
 void Walk::myStep() {
   int ret = step(mTimeStep);
@@ -88,83 +247,15 @@ void Walk::wait(int ms) {
     myStep();
 }
 
-#ifdef USE_MONGODB
-string Walk::getMongoAction() {
-  if (!mMongoConnected) {
-    return "idle";
-  }
-
-  try {
-    // replay_name이 "your_database_name"인 문서만 필터링
-    auto filter = document{} << "replay_name" << "your_database_name" << finalize;
-    
-    // 첫 번째 매칭 문서 찾기
-    auto maybe_result = mCollection.find_one(filter.view());
-    
-    if (maybe_result) {
-      auto doc = maybe_result.value();
-      
-      // current_action 필드 추출
-      auto action_element = doc["current_action"];
-      
-      if (action_element && action_element.type() == bsoncxx::type::k_utf8) {
-        string action = action_element.get_utf8().value.to_string();
-        cout << "[MongoDB] replay_name='your_database_name'에서 current_action: " << action << endl;
-        return action;
-      } else {
-        cout << "[MongoDB] current_action 필드가 없거나 문자열이 아닙니다." << endl;
-        return "idle";
-      }
-    } else {
-      cout << "[MongoDB] replay_name 'your_database_name'인 문서를 찾을 수 없습니다." << endl;
-      return "idle";
-    }
-    
-  } catch (const exception& e) {
-    cout << "[MongoDB] 쿼리 오류: " << e.what() << endl;
-    return "idle";
-  }
-}
-
-void Walk::executeMongoAction(const string& action) {
-  cout << "[실행] 액션: " << action << endl;
-  
-  if (action == "forward") {
-    mGaitManager->setXAmplitude(1.0);
-    mGaitManager->setAAmplitude(0.0);
-    cout << "→ 앞으로 걷기" << endl;
-  }
-  else if (action == "backward") {
-    mGaitManager->setXAmplitude(-1.0);
-    mGaitManager->setAAmplitude(0.0);
-    cout << "→ 뒤로 걷기" << endl;
-  }
-  else if (action == "left") {
-    mGaitManager->setXAmplitude(0.0);
-    mGaitManager->setAAmplitude(0.5);
-    cout << "→ 왼쪽으로 회전" << endl;
-  }
-  else if (action == "right") {
-    mGaitManager->setXAmplitude(0.0);
-    mGaitManager->setAAmplitude(-0.5);
-    cout << "→ 오른쪽으로 회전" << endl;
-  }
-  else { // "idle" 또는 기타
-    mGaitManager->setXAmplitude(0.0);
-    mGaitManager->setAAmplitude(0.0);
-    cout << "→ 제자리 서기" << endl;
-  }
-}
-#endif
-
 void Walk::run() {
   cout << "=======================================" << endl;
   cout << "MongoDB 통합 ROBOTIS OP2 Walk Controller" << endl;
   cout << "=======================================" << endl;
   
 #ifdef USE_MONGODB
-  cout << "MongoDB에서 replay_name='your_database_name'의" << endl;
+  cout << "MongoDB에서 replay_name='" << mReplayName << "'의" << endl;
   cout << "current_action 값을 읽어서 자동 제어합니다." << endl;
+  cout << "폴링 간격: " << mPollInterval << "ms" << endl;
 #else
   cout << "MongoDB 비활성화 - 정지 상태" << endl;
 #endif
@@ -172,14 +263,12 @@ void Walk::run() {
 
   myStep();
   
-  // 초기 위치로 이동
   cout << "[초기화] 기본 자세로 이동중..." << endl;
   mMotionManager->playPage(9);
   wait(200);
 
 #ifdef USE_MONGODB
   if (mMongoConnected) {
-    // 자동으로 걷기 시작
     mGaitManager->start();
     cout << "[시작] 걷기 모드 활성화" << endl;
     cout << "[대기] MongoDB에서 명령 대기중..." << endl;
@@ -188,15 +277,17 @@ void Walk::run() {
   }
 #endif
 
-  // 메인 루프 - MongoDB 데이터로 제어
+  // 폴링 간격 계산 (mTimeStep 단위로)
+  int pollSteps = mPollInterval / mTimeStep;
+  if (pollSteps < 1) pollSteps = 1;
+
   while (true) {
     checkIfFallen();
 
 #ifdef USE_MONGODB
-    if (mMongoConnected) {
-      // 10번의 스텝마다 MongoDB 체크 (약 160ms마다)
+    if (mMongoConnected || mReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       mMongoCheckCounter++;
-      if (mMongoCheckCounter >= 10) {
+      if (mMongoCheckCounter >= pollSteps) {
         string mongoAction = getMongoAction();
         executeMongoAction(mongoAction);
         mMongoCheckCounter = 0;
