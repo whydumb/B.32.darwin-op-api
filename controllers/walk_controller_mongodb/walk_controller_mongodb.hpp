@@ -1,4 +1,4 @@
-// walk_controller_mongodb.hpp - 개선된 MongoDB 버전
+// walk_controller_mongodb.hpp - Fixed MongoDB version
 #ifndef WALK_CONTROLLER_MONGODB_HPP
 #define WALK_CONTROLLER_MONGODB_HPP
 
@@ -53,26 +53,26 @@ private:
   managers::RobotisOp2GaitManager *mGaitManager;
 
 #ifdef USE_MONGODB
-  // MongoDB 인스턴스 및 연결
+  // MongoDB instance and connection
   std::unique_ptr<mongocxx::instance> mMongoInstance;
   std::unique_ptr<mongocxx::client> mMongoClient;
   mongocxx::collection mCollection;
   
-  // 연결 상태 및 설정
+  // Connection status and configuration
   bool mMongoConnected;
   int mMongoCheckCounter;
   std::string mLastAction;
   int mReconnectAttempts;
   static const int MAX_RECONNECT_ATTEMPTS = 5;
   
-  // 설정값들
+  // Configuration values - ADDED MISSING DECLARATIONS
   std::string mDbName;
   std::string mCollectionName;
   std::string mReplayName;
   std::string mMongoUri;
   int mPollInterval;
   
-  // MongoDB 관련 메서드
+  // MongoDB related methods
   void loadMongoConfig();
   void initializeMongoDB();
   void testMongoConnection();
