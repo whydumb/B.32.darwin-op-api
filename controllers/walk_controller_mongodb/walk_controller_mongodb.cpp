@@ -1,4 +1,4 @@
-// walk_controller_mongodb.cpp - 개선된 MongoDB 버전
+// walk_controller_mongodb.cpp - Fixed MongoDB version
 #include "walk_controller_mongodb.hpp"
 #include <RobotisOp2GaitManager.hpp>
 #include <RobotisOp2MotionManager.hpp>
@@ -41,59 +41,81 @@ static const char *motorNames[NMOTORS] = {
 };
 
 Walk::Walk() : Robot() {
-  mTimeStep = getBasicTimeStep();
+  mTimeStep = static_cast<int>(getBasicTimeStep());
 
-  getLED("HeadLed")->set(0xFF0000);
-  getLED("EyeLed")->set(0x00FF00);
+  // Initialize LEDs with error checking
+  LED* headLed = getLED("HeadLed");
+  LED* eyeLed = getLED("EyeLed");
+  if (headLed) headLed->set(0xFF0000);
+  if (eyeLed) eyeLed->set(0x00FF00);
   
   mAccelerometer = getAccelerometer("Accelerometer");
-  mAccelerometer->enable(mTimeStep);
+  if (mAccelerometer) {
+    mAccelerometer->enable(mTimeStep);
+  }
 
+  // Initialize motors and position sensors
   for (int i = 0; i < NMOTORS; i++) {
     mMotors[i] = getMotor(motorNames[i]);
     string sensorName = motorNames[i];
     sensorName.push_back('S');
     mPositionSensors[i] = getPositionSensor(sensorName);
-    mPositionSensors[i]->enable(mTimeStep);
+    if (mPositionSensors[i]) {
+      mPositionSensors[i]->enable(mTimeStep);
+    }
   }
 
   mMotionManager = new RobotisOp2MotionManager(this);
   mGaitManager = new RobotisOp2GaitManager(this, "config.ini");
 
 #ifdef USE_MONGODB
-  // config.ini에서 MongoDB 설정 읽기
+  // Initialize MongoDB variables with default values
+  mPollInterval = 500; // Default 500ms
+  mMongoConnected = false;
+  mMongoCheckCounter = 0;
+  mLastAction = "idle";
+  mReconnectAttempts = 0;
+  
+  // Load MongoDB configuration from config.ini
   loadMongoConfig();
   initializeMongoDB();
 #endif
 }
 
 Walk::~Walk() {
-  delete mMotionManager;
-  delete mGaitManager;
+  if (mMotionManager) {
+    delete mMotionManager;
+  }
+  if (mGaitManager) {
+    delete mGaitManager;
+  }
 }
 
 #ifdef USE_MONGODB
 void Walk::loadMongoConfig() {
-  // 기본값 설정
+  // Set default values
   mDbName = "movement_tracker";
   mCollectionName = "movementtracker";
-  mReplayName = "your_database_name";
+  mReplayName = "default_replay";
   mPollInterval = 500;
   mMongoUri = "mongodb://localhost:27017";
   
   ifstream configFile("config.ini");
   if (!configFile.is_open()) {
-    cout << "[Config] config.ini 파일을 찾을 수 없습니다. 기본값 사용" << endl;
+    cout << "[Config] config.ini file not found. Using default values" << endl;
     return;
   }
   
   string line;
   while (getline(configFile, line)) {
+    // Skip empty lines and comments
+    if (line.empty() || line[0] == '#') continue;
+    
     if (line.find("replay_name") != string::npos) {
       size_t pos = line.find("=");
       if (pos != string::npos) {
         mReplayName = line.substr(pos + 1);
-        // 공백 제거
+        // Remove whitespace
         mReplayName.erase(0, mReplayName.find_first_not_of(" \t"));
         mReplayName.erase(mReplayName.find_last_not_of(" \t") + 1);
       }
@@ -102,17 +124,52 @@ void Walk::loadMongoConfig() {
       size_t pos = line.find("=");
       if (pos != string::npos) {
         string value = line.substr(pos + 1);
-        mPollInterval = stoi(value);
+        try {
+          mPollInterval = stoi(value);
+          if (mPollInterval < 100) mPollInterval = 100; // Minimum 100ms
+        } catch (const exception& e) {
+          cout << "[Config] Invalid poll_interval value, using default 500ms" << endl;
+          mPollInterval = 500;
+        }
+      }
+    }
+    else if (line.find("mongo_uri") != string::npos) {
+      size_t pos = line.find("=");
+      if (pos != string::npos) {
+        mMongoUri = line.substr(pos + 1);
+        // Remove whitespace
+        mMongoUri.erase(0, mMongoUri.find_first_not_of(" \t"));
+        mMongoUri.erase(mMongoUri.find_last_not_of(" \t") + 1);
+      }
+    }
+    else if (line.find("database_name") != string::npos) {
+      size_t pos = line.find("=");
+      if (pos != string::npos) {
+        mDbName = line.substr(pos + 1);
+        mDbName.erase(0, mDbName.find_first_not_of(" \t"));
+        mDbName.erase(mDbName.find_last_not_of(" \t") + 1);
+      }
+    }
+    else if (line.find("collection_name") != string::npos) {
+      size_t pos = line.find("=");
+      if (pos != string::npos) {
+        mCollectionName = line.substr(pos + 1);
+        mCollectionName.erase(0, mCollectionName.find_first_not_of(" \t"));
+        mCollectionName.erase(mCollectionName.find_last_not_of(" \t") + 1);
       }
     }
   }
   
   cout << "[Config] Replay Name: " << mReplayName << ", Poll Interval: " << mPollInterval << "ms" << endl;
+  cout << "[Config] MongoDB URI: " << mMongoUri << endl;
+  cout << "[Config] Database: " << mDbName << ", Collection: " << mCollectionName << endl;
 }
 
 void Walk::initializeMongoDB() {
   try {
-    mMongoInstance = make_unique<mongocxx::instance>();
+    // Initialize MongoDB instance (singleton)
+    static mongocxx::instance instance{};
+    
     mMongoClient = make_unique<mongocxx::client>(mongocxx::uri{mMongoUri});
     mCollection = (*mMongoClient)[mDbName][mCollectionName];
     mMongoConnected = true;
@@ -120,35 +177,35 @@ void Walk::initializeMongoDB() {
     mLastAction = "idle";
     mReconnectAttempts = 0;
     
-    // 연결 테스트
+    // Test connection
     testMongoConnection();
     
-    cout << "[MongoDB] 연결 성공 - " << mDbName << "." << mCollectionName << endl;
+    cout << "[MongoDB] Connection successful - " << mDbName << "." << mCollectionName << endl;
   } catch (const exception& e) {
     mMongoConnected = false;
-    cout << "[MongoDB] 연결 실패: " << e.what() << endl;
+    cout << "[MongoDB] Connection failed: " << e.what() << endl;
   }
 }
 
 void Walk::testMongoConnection() {
   try {
-    // 간단한 ping 테스트
-    auto admin = (*mMongoClient)["admin"];
+    // Simple ping test
+    mongocxx::database admin = (*mMongoClient)["admin"];
     auto result = admin.run_command(document{} << "ping" << 1 << finalize);
-    cout << "[MongoDB] 연결 테스트 성공" << endl;
+    cout << "[MongoDB] Connection test successful" << endl;
   } catch (const exception& e) {
-    cout << "[MongoDB] 연결 테스트 실패: " << e.what() << endl;
+    cout << "[MongoDB] Connection test failed: " << e.what() << endl;
     throw;
   }
 }
 
 bool Walk::reconnectMongoDB() {
   if (mReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    cout << "[MongoDB] 최대 재연결 시도 횟수 초과" << endl;
+    cout << "[MongoDB] Maximum reconnection attempts exceeded" << endl;
     return false;
   }
   
-  cout << "[MongoDB] 재연결 시도 " << (mReconnectAttempts + 1) << "/" << MAX_RECONNECT_ATTEMPTS << endl;
+  cout << "[MongoDB] Reconnection attempt " << (mReconnectAttempts + 1) << "/" << MAX_RECONNECT_ATTEMPTS << endl;
   mReconnectAttempts++;
   
   try {
@@ -158,10 +215,10 @@ bool Walk::reconnectMongoDB() {
     
     mMongoConnected = true;
     mReconnectAttempts = 0;
-    cout << "[MongoDB] 재연결 성공" << endl;
+    cout << "[MongoDB] Reconnection successful" << endl;
     return true;
   } catch (const exception& e) {
-    cout << "[MongoDB] 재연결 실패: " << e.what() << endl;
+    cout << "[MongoDB] Reconnection failed: " << e.what() << endl;
     return false;
   }
 }
@@ -169,12 +226,12 @@ bool Walk::reconnectMongoDB() {
 string Walk::getMongoAction() {
   if (!mMongoConnected) {
     if (!reconnectMongoDB()) {
-      return mLastAction; // 마지막 성공한 액션 유지
+      return mLastAction; // Keep last successful action
     }
   }
 
   try {
-    // replay_name으로 필터링
+    // Filter by replay_name
     auto filter = document{} << "replay_name" << mReplayName << finalize;
     
     auto maybe_result = mCollection.find_one(filter.view());
@@ -183,34 +240,36 @@ string Walk::getMongoAction() {
       auto doc = maybe_result.value();
       auto action_element = doc["current_action"];
       
-      if (action_element && action_element.type() == bsoncxx::type::k_utf8) {
-        string action = action_element.get_utf8().value.to_string();
+      if (action_element && action_element.type() == bsoncxx::type::k_string) {
+        string action = string(action_element.get_string().value);
         
-        // 액션이 변경되었을 때만 로그 출력
+        // Log only when action changes
         if (action != mLastAction) {
-          cout << "[MongoDB] Replay '" << mReplayName << "' 새 액션: " << action << endl;
+          cout << "[MongoDB] Replay '" << mReplayName << "' new action: " << action << endl;
           mLastAction = action;
         }
         
-        mReconnectAttempts = 0; // 성공시 재연결 카운터 리셋
+        mReconnectAttempts = 0; // Reset reconnection counter on success
         return action;
       } else {
-        cout << "[MongoDB] current_action 필드가 없거나 잘못된 타입입니다." << endl;
+        cout << "[MongoDB] current_action field missing or wrong type" << endl;
         return mLastAction;
       }
     } else {
-      cout << "[MongoDB] replay_name '" << mReplayName << "'인 문서를 찾을 수 없습니다." << endl;
+      cout << "[MongoDB] No document found with replay_name '" << mReplayName << "'" << endl;
       return mLastAction;
     }
     
   } catch (const exception& e) {
-    cout << "[MongoDB] 쿼리 오류: " << e.what() << endl;
+    cout << "[MongoDB] Query error: " << e.what() << endl;
     mMongoConnected = false;
     return mLastAction;
   }
 }
 
 void Walk::executeMongoAction(const string& action) {
+  if (!mGaitManager) return;
+  
   if (action == "forward") {
     mGaitManager->setXAmplitude(1.0);
     mGaitManager->setAAmplitude(0.0);
@@ -227,7 +286,7 @@ void Walk::executeMongoAction(const string& action) {
     mGaitManager->setXAmplitude(0.0);
     mGaitManager->setAAmplitude(-0.5);
   }
-  else { // "idle" 또는 기타
+  else { // "idle" or other
     mGaitManager->setXAmplitude(0.0);
     mGaitManager->setAAmplitude(0.0);
   }
@@ -249,37 +308,41 @@ void Walk::wait(int ms) {
 
 void Walk::run() {
   cout << "=======================================" << endl;
-  cout << "MongoDB 통합 ROBOTIS OP2 Walk Controller" << endl;
+  cout << "MongoDB Integrated ROBOTIS OP2 Walk Controller" << endl;
   cout << "=======================================" << endl;
   
 #ifdef USE_MONGODB
-  cout << "MongoDB에서 replay_name='" << mReplayName << "'의" << endl;
-  cout << "current_action 값을 읽어서 자동 제어합니다." << endl;
-  cout << "폴링 간격: " << mPollInterval << "ms" << endl;
+  cout << "Reading current_action from MongoDB with replay_name='" << mReplayName << "'" << endl;
+  cout << "for automatic control." << endl;
+  cout << "Polling interval: " << mPollInterval << "ms" << endl;
 #else
-  cout << "MongoDB 비활성화 - 정지 상태" << endl;
+  cout << "MongoDB disabled - staying in idle state" << endl;
 #endif
   cout << "=======================================" << endl;
 
   myStep();
   
-  cout << "[초기화] 기본 자세로 이동중..." << endl;
-  mMotionManager->playPage(9);
-  wait(200);
+  cout << "[Initialize] Moving to basic position..." << endl;
+  if (mMotionManager) {
+    mMotionManager->playPage(9);
+    wait(200);
+  }
 
 #ifdef USE_MONGODB
-  if (mMongoConnected) {
+  if (mMongoConnected && mGaitManager) {
     mGaitManager->start();
-    cout << "[시작] 걷기 모드 활성화" << endl;
-    cout << "[대기] MongoDB에서 명령 대기중..." << endl;
+    cout << "[Start] Walking mode activated" << endl;
+    cout << "[Waiting] Waiting for commands from MongoDB..." << endl;
   } else {
-    cout << "[오류] MongoDB 연결 실패 - 정지 상태" << endl;
+    cout << "[Error] MongoDB connection failed - staying in idle state" << endl;
   }
 #endif
 
-  // 폴링 간격 계산 (mTimeStep 단위로)
-  int pollSteps = mPollInterval / mTimeStep;
+  // Calculate polling interval (in mTimeStep units)
+  int pollSteps = (mTimeStep > 0) ? (mPollInterval / mTimeStep) : 62; // Default ~500ms at 8ms timestep
   if (pollSteps < 1) pollSteps = 1;
+
+  cout << "[Info] Poll steps: " << pollSteps << " (TimeStep: " << mTimeStep << "ms)" << endl;
 
   while (true) {
     checkIfFallen();
@@ -295,36 +358,40 @@ void Walk::run() {
     }
 #endif
 
-    mGaitManager->step(mTimeStep);
+    if (mGaitManager) {
+      mGaitManager->step(mTimeStep);
+    }
     myStep();
   }
 }
 
 void Walk::checkIfFallen() {
+  if (!mAccelerometer) return;
+  
   static int fup = 0;
   static int fdown = 0;
   static const double acc_tolerance = 80.0;
   static const double acc_step = 100;
 
   const double *acc = mAccelerometer->getValues();
-  if (acc[1] < 512.0 - acc_tolerance)
+  if (acc && acc[1] < 512.0 - acc_tolerance)
     fup++;
   else
     fup = 0;
 
-  if (acc[1] > 512.0 + acc_tolerance)
+  if (acc && acc[1] > 512.0 + acc_tolerance)
     fdown++;
   else
     fdown = 0;
 
-  if (fup > acc_step) {
-    cout << "[낙상감지] 앞으로 넘어짐 - 복구중..." << endl;
+  if (fup > acc_step && mMotionManager) {
+    cout << "[Fall Detection] Fell forward - recovering..." << endl;
     mMotionManager->playPage(10); // f_up
     mMotionManager->playPage(9);  // init position
     fup = 0;
   }
-  else if (fdown > acc_step) {
-    cout << "[낙상감지] 뒤로 넘어짐 - 복구중..." << endl;
+  else if (fdown > acc_step && mMotionManager) {
+    cout << "[Fall Detection] Fell backward - recovering..." << endl;
     mMotionManager->playPage(11); // b_up
     mMotionManager->playPage(9);  // init position
     fdown = 0;
